@@ -17,7 +17,7 @@ import uvicorn
 app = FastAPI()
 
 # API Key - get from environment or use fallback
-HUME_API_KEY = os.getenv("HUME_API_KEY", "6uv6tCule5TJqnN0gSGP0MbA89jZiCh3DO3DuxGvcCouAeyC")
+HUME_API_KEY = os.getenv("HUME_API_KEY", "ZvEVO2dQuKoVcshTyW6zVs48aVir5FJgpMnTyKGvZkt7FzYg")
 
 # Instantiate the Hume clients
 client = AsyncHumeClient(api_key=HUME_API_KEY)
