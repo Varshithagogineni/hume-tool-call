@@ -242,8 +242,14 @@ async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneCli
         return
     
     try:
-        # Parse tool parameters
-        parameters = tool_call_message.parameters or {}
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
         
         # Extract search parameters
         name = parameters.get("name")
