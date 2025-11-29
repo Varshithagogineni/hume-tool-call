@@ -247,7 +247,8 @@ async def get_providers(location_id=None, requestable=None, provider_name=None):
         # Prepare query parameters
         params = {
             "subdomain": SYNCRONIZER_SUBDOMAIN,
-            "per_page": 20  # Reasonable limit for voice agent
+            "per_page": 20,  # Reasonable limit for voice agent
+            "include[]": "locations"  # Include location data for providers
         }
         
         # Add optional filters
@@ -300,6 +301,29 @@ async def get_providers(location_id=None, requestable=None, provider_name=None):
                 # Format provider results for voice agent
                 formatted_providers = []
                 for provider in providers[:10]:  # Limit to 10 for voice
+                    # Extract location information
+                    provider_locations = provider.get("locations", [])
+                    location_names = []
+                    location_ids = []
+                    
+                    # Debug: Print location data structure
+                    print(f"[DEBUG] Provider {provider.get('name')} locations: {provider_locations}")
+                    
+                    # Handle different possible location data structures
+                    if provider_locations:
+                        for location in provider_locations:
+                            if isinstance(location, dict):
+                                location_names.append(location.get("name", "Unknown Location"))
+                                location_ids.append(location.get("id"))
+                            elif isinstance(location, (str, int)):
+                                # Location might be just an ID or name
+                                location_names.append(str(location))
+                    else:
+                        # If no specific locations, assume they work at the main practice location
+                        # Use the known location from our configuration
+                        location_names.append("Green River Dental")  # Default location name
+                        location_ids.append(SYNCRONIZER_LOCATION_ID)
+                    
                     formatted_provider = {
                         "id": provider.get("id"),
                         "name": f"Dr. {provider.get('first_name', '')} {provider.get('last_name', '')}".strip(),
@@ -307,7 +331,9 @@ async def get_providers(location_id=None, requestable=None, provider_name=None):
                         "last_name": provider.get("last_name"),
                         "title": provider.get("title", "Doctor"),
                         "speciality": provider.get("speciality"),
-                        "requestable": provider.get("requestable", True)
+                        "requestable": provider.get("requestable", True),
+                        "locations": location_names,
+                        "location_ids": location_ids
                     }
                     formatted_providers.append(formatted_provider)
                 
@@ -336,6 +362,174 @@ async def get_providers(location_id=None, requestable=None, provider_name=None):
             "success": False,
             "message": f"Error retrieving providers: {str(e)}",
             "providers": []
+        }
+
+async def get_locations(location_name=None, include_inactive=False, location_id=None):
+    """
+    Get practice locations from the Syncronizer.io API.
+    
+    Args:
+        location_name: Location name to search for (optional, for filtering results)
+        include_inactive: Include inactive locations (optional, default False)
+        location_id: Get specific location by ID (optional)
+    
+    Returns:
+        List of locations or specific location, or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to access location information.",
+                "locations": []
+            }
+        
+        # Prepare query parameters
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN
+        }
+        
+        # Add optional filters
+        if include_inactive:
+            params["inactive"] = True
+        
+        # Set up headers with bearer token
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+            "Nex-Api-Version": "v20240412"
+        }
+        
+        # Choose endpoint based on whether we're getting a specific location
+        if location_id:
+            endpoint = f"{SYNCRONIZER_BASE_URL}/locations/{location_id}"
+        else:
+            endpoint = f"{SYNCRONIZER_BASE_URL}/locations"
+        
+        # Make API request
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                endpoint,
+                params=params,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if location_id:
+                    # Single location response
+                    location_data = data.get("data", {})
+                    if not location_data:
+                        return {
+                            "success": False,
+                            "message": f"Location with ID {location_id} not found.",
+                            "locations": []
+                        }
+                    
+                    formatted_location = {
+                        "id": location_data.get("id"),
+                        "name": location_data.get("name"),
+                        "address": location_data.get("street_address"),  # API uses street_address
+                        "phone": location_data.get("phone_number"),      # API uses phone_number
+                        "city": location_data.get("city"),
+                        "state": location_data.get("state"),
+                        "zip_code": location_data.get("zip_code"),
+                        "inactive": location_data.get("inactive", False)
+                    }
+                    
+                    return {
+                        "success": True,
+                        "message": f"Found location: {formatted_location['name']}",
+                        "locations": [formatted_location],
+                        "total_count": 1
+                    }
+                else:
+                    # Multiple locations response - API returns institution with locations array
+                    institution_data = data.get("data", [])
+                    
+                    # Handle case where API returns institution objects with locations
+                    locations = []
+                    if isinstance(institution_data, list) and len(institution_data) > 0:
+                        # Extract locations from institution data
+                        for institution in institution_data:
+                            institution_locations = institution.get("locations", [])
+                            locations.extend(institution_locations)
+                    else:
+                        # Direct locations array (fallback)
+                        locations = institution_data if isinstance(institution_data, list) else []
+                    
+                    # If no locations found in nested structure, create a default location from known data
+                    if not locations and SYNCRONIZER_LOCATION_ID:
+                        # Fallback: get the specific location we know exists
+                        specific_result = await get_locations(location_id=SYNCRONIZER_LOCATION_ID)
+                        if specific_result["success"] and specific_result["locations"]:
+                            locations = specific_result["locations"]
+                    
+                    # Filter by location name if specified (client-side filtering)
+                    if location_name and locations:
+                        filtered_locations = []
+                        search_name = location_name.lower()
+                        for location in locations:
+                            location_full_name = location.get('name', '').lower()
+                            location_address = f"{location.get('street_address', '')} {location.get('city', '')}".lower()
+                            
+                            if (search_name in location_full_name or 
+                                search_name in location_address or
+                                any(search_name in word for word in location_full_name.split())):
+                                filtered_locations.append(location)
+                        locations = filtered_locations
+                    
+                    if not locations:
+                        return {
+                            "success": False,
+                            "message": "No locations found matching your criteria.",
+                            "locations": []
+                        }
+                    
+                    # Format location results for voice agent
+                    formatted_locations = []
+                    for location in locations:
+                        formatted_location = {
+                            "id": location.get("id"),
+                            "name": location.get("name"),
+                            "address": location.get("street_address"),  # API uses street_address
+                            "phone": location.get("phone_number"),      # API uses phone_number
+                            "city": location.get("city"),
+                            "state": location.get("state"),
+                            "zip_code": location.get("zip_code"),
+                            "inactive": location.get("inactive", False)
+                        }
+                        formatted_locations.append(formatted_location)
+                    
+                    return {
+                        "success": True,
+                        "message": f"Found {len(locations)} location(s).",
+                        "locations": formatted_locations,
+                        "total_count": data.get("count", len(locations))
+                    }
+            
+            else:
+                return {
+                    "success": False,
+                    "message": f"API error: {response.status_code} - {response.text}",
+                    "locations": []
+                }
+                
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": "Request timed out. Please try again.",
+            "locations": []
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error retrieving locations: {str(e)}",
+            "locations": []
         }
 
 async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
@@ -483,12 +677,30 @@ async def handle_get_providers_tool(control_plane_client: AsyncControlPlaneClien
                     provider_info = provider['name']
                     if provider.get('speciality'):
                         provider_info += f" ({provider['speciality']})"
+                    
+                    # Add location information if available
+                    locations = provider.get('locations', [])
+                    if locations:
+                        if len(locations) == 1:
+                            provider_info += f" at {locations[0]}"
+                        elif len(locations) > 1:
+                            provider_info += f" at {', '.join(locations)}"
+                    
                     if not provider.get('requestable', True):
                         provider_info += " (not available for online booking)"
                     provider_list.append(provider_info)
                 
                 if len(provider_list) == 1:
-                    response_content = f"I found 1 provider: {provider_list[0]}. Would you like to schedule with this doctor?"
+                    provider = result["providers"][0]
+                    locations = provider.get('locations', [])
+                    
+                    if locations:
+                        if len(locations) == 1:
+                            response_content = f"I found {provider_list[0]}. Would you like to schedule an appointment with this doctor?"
+                        else:
+                            response_content = f"I found {provider_list[0]}. Which location would you prefer for your appointment?"
+                    else:
+                        response_content = f"I found 1 provider: {provider_list[0]}. Would you like to schedule with this doctor?"
                 elif len(provider_list) <= 5:
                     response_content = f"I found {len(provider_list)} providers:\n"
                     for i, provider in enumerate(provider_list, 1):
@@ -528,6 +740,125 @@ async def handle_get_providers_tool(control_plane_client: AsyncControlPlaneClien
                 tool_call_id=tool_call_id,
                 error="ProviderSearchError",
                 content=f"I'm having trouble finding provider information right now. Please try again or contact our office directly. Error: {str(e)}"
+            )
+            )
+
+async def handle_get_locations_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the get_locations tool call and send the response back to the chat.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "get_locations":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
+        
+        # Extract search parameters
+        location_name = parameters.get("location_name")
+        include_inactive = parameters.get("include_inactive", False)
+        location_id = parameters.get("location_id")
+        
+        print(f"[LOCATIONS] Searching locations with: location_name={location_name}, include_inactive={include_inactive}, location_id={location_id}")
+        
+        # Get locations
+        result = await get_locations(
+            location_name=location_name,
+            include_inactive=include_inactive,
+            location_id=location_id
+        )
+        
+        # Format response for voice agent
+        if result["success"]:
+            if result["locations"]:
+                locations = result["locations"]
+                
+                if len(locations) == 1:
+                    location = locations[0]
+                    address_parts = []
+                    if location.get('address'):
+                        address_parts.append(location['address'])
+                    if location.get('city'):
+                        address_parts.append(location['city'])
+                    if location.get('state'):
+                        address_parts.append(location['state'])
+                    
+                    full_address = ", ".join(address_parts) if address_parts else "Address not available"
+                    
+                    response_content = f"I found our {location['name']} location at {full_address}."
+                    if location.get('phone'):
+                        response_content += f" The phone number is {location['phone']}."
+                    
+                    if location_id:
+                        response_content += " Would you like to schedule an appointment at this location?"
+                    
+                elif len(locations) <= 4:
+                    response_content = f"We have {len(locations)} locations:\n"
+                    for i, location in enumerate(locations, 1):
+                        location_info = f"{i}. {location['name']}"
+                        if location.get('city'):
+                            location_info += f" in {location['city']}"
+                        if location.get('inactive'):
+                            location_info += " (currently closed)"
+                        response_content += f"{location_info}\n"
+                    response_content += "Which location would you prefer for your appointment?"
+                
+                else:
+                    # Show first 4 if many results
+                    response_content = f"We have {len(locations)} locations. Here are our main offices:\n"
+                    for i, location in enumerate(locations[:4], 1):
+                        location_info = f"{i}. {location['name']}"
+                        if location.get('city'):
+                            location_info += f" in {location['city']}"
+                        response_content += f"{location_info}\n"
+                    response_content += "Which location works best for you, or would you like to hear about more locations?"
+                    
+            else:
+                if location_name:
+                    response_content = f"I couldn't find a location matching '{location_name}'. Let me show you our available locations instead."
+                else:
+                    response_content = "I couldn't find any locations matching your criteria. Let me connect you with someone who can help."
+        else:
+            response_content = f"I encountered an issue while looking up our locations: {result['message']}"
+        
+        # Send the result as a tool response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Location search completed successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle get locations tool: {e}")
+        
+        # Send error response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="LocationSearchError",
+                content=f"I'm having trouble finding location information right now. Please try again or contact our office directly. Error: {str(e)}"
             )
         )
 
@@ -616,6 +947,8 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             await handle_search_patients_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "get_providers":
             await handle_get_providers_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        elif tool_name == "get_locations":
+            await handle_get_locations_tool(control_plane_client, event.chat_id, event.tool_call_message)
         else:
             print(f"[ERROR] Unknown tool: {tool_name}")
             # Send error response for unknown tools
