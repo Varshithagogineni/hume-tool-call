@@ -222,6 +222,122 @@ async def search_patients(name=None, phone_number=None, email=None, date_of_birt
             "patients": []
         }
 
+async def get_providers(location_id=None, requestable=None, provider_name=None):
+    """
+    Get providers (doctors, dentists, hygienists) from the Syncronizer.io API.
+    
+    Args:
+        location_id: Filter by specific location (optional)
+        requestable: Only providers accepting online scheduling (optional)
+        provider_name: Provider name to search for (optional, for filtering results)
+    
+    Returns:
+        List of providers or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to access provider information.",
+                "providers": []
+            }
+        
+        # Prepare query parameters
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN,
+            "per_page": 20  # Reasonable limit for voice agent
+        }
+        
+        # Add optional filters
+        if location_id:
+            params["location_id"] = location_id
+        if requestable is not None:
+            params["requestable"] = requestable
+        
+        # Set up headers with bearer token
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+            "Nex-Api-Version": "v20240412"
+        }
+        
+        # Make API request
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SYNCRONIZER_BASE_URL}/providers",
+                params=params,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                providers = data.get("data", [])
+                
+                # Filter by provider name if specified (client-side filtering)
+                if provider_name:
+                    filtered_providers = []
+                    search_name = provider_name.lower()
+                    for provider in providers:
+                        provider_full_name = f"{provider.get('first_name', '')} {provider.get('last_name', '')}".strip().lower()
+                        provider_last_name = provider.get('last_name', '').lower()
+                        
+                        if (search_name in provider_full_name or 
+                            search_name in provider_last_name or
+                            provider_last_name.startswith(search_name)):
+                            filtered_providers.append(provider)
+                    providers = filtered_providers
+                
+                if not providers:
+                    return {
+                        "success": False,
+                        "message": "No providers found matching your criteria.",
+                        "providers": []
+                    }
+                
+                # Format provider results for voice agent
+                formatted_providers = []
+                for provider in providers[:10]:  # Limit to 10 for voice
+                    formatted_provider = {
+                        "id": provider.get("id"),
+                        "name": f"Dr. {provider.get('first_name', '')} {provider.get('last_name', '')}".strip(),
+                        "first_name": provider.get("first_name"),
+                        "last_name": provider.get("last_name"),
+                        "title": provider.get("title", "Doctor"),
+                        "speciality": provider.get("speciality"),
+                        "requestable": provider.get("requestable", True)
+                    }
+                    formatted_providers.append(formatted_provider)
+                
+                return {
+                    "success": True,
+                    "message": f"Found {len(providers)} provider(s).",
+                    "providers": formatted_providers,
+                    "total_count": data.get("count", len(providers))
+                }
+            
+            else:
+                return {
+                    "success": False,
+                    "message": f"API error: {response.status_code} - {response.text}",
+                    "providers": []
+                }
+                
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": "Request timed out. Please try again.",
+            "providers": []
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error retrieving providers: {str(e)}",
+            "providers": []
+        }
+
 async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
     """
     Handle the search_patients tool call and send the response back to the chat.
@@ -313,6 +429,106 @@ async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneCli
                 error="PatientSearchError",
                 content=f"I'm having trouble searching for patients right now. Please try again or contact our office directly. Error: {str(e)}"
             )
+            )
+
+async def handle_get_providers_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the get_providers tool call and send the response back to the chat.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "get_providers":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
+        
+        # Extract search parameters
+        location_id = parameters.get("location_id")
+        requestable = parameters.get("requestable") 
+        provider_name = parameters.get("provider_name")
+        
+        print(f"[PROVIDERS] Searching providers with: location_id={location_id}, requestable={requestable}, provider_name={provider_name}")
+        
+        # Get providers
+        result = await get_providers(
+            location_id=location_id,
+            requestable=requestable,
+            provider_name=provider_name
+        )
+        
+        # Format response for voice agent
+        if result["success"]:
+            if result["providers"]:
+                # Format provider list for natural speech
+                provider_list = []
+                for provider in result["providers"]:
+                    provider_info = provider['name']
+                    if provider.get('speciality'):
+                        provider_info += f" ({provider['speciality']})"
+                    if not provider.get('requestable', True):
+                        provider_info += " (not available for online booking)"
+                    provider_list.append(provider_info)
+                
+                if len(provider_list) == 1:
+                    response_content = f"I found 1 provider: {provider_list[0]}. Would you like to schedule with this doctor?"
+                elif len(provider_list) <= 5:
+                    response_content = f"I found {len(provider_list)} providers:\n"
+                    for i, provider in enumerate(provider_list, 1):
+                        response_content += f"{i}. {provider}\n"
+                    response_content += "Which doctor would you prefer?"
+                else:
+                    # Show first 5 if many results
+                    response_content = f"I found {len(provider_list)} providers. Here are the first 5:\n"
+                    for i, provider in enumerate(provider_list[:5], 1):
+                        response_content += f"{i}. {provider}\n"
+                    response_content += "Would you like to see more options or choose from these?"
+            else:
+                if provider_name:
+                    response_content = f"I couldn't find a provider named '{provider_name}'. Could you check the spelling or try a different name? I can also show you all available providers."
+                else:
+                    response_content = "I couldn't find any providers matching your criteria. Let me check our available doctors for you."
+        else:
+            response_content = f"I encountered an issue while looking up providers: {result['message']}"
+        
+        # Send the result as a tool response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Provider search completed successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle get providers tool: {e}")
+        
+        # Send error response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="ProviderSearchError",
+                content=f"I'm having trouble finding provider information right now. Please try again or contact our office directly. Error: {str(e)}"
+            )
         )
 
 async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
@@ -398,6 +614,8 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             await handle_dad_joke_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "search_patients":
             await handle_search_patients_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        elif tool_name == "get_providers":
+            await handle_get_providers_tool(control_plane_client, event.chat_id, event.tool_call_message)
         else:
             print(f"[ERROR] Unknown tool: {tool_name}")
             # Send error response for unknown tools
