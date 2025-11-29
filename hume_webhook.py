@@ -76,7 +76,7 @@ async def authenticate_syncronizer():
                 timeout=10.0
             )
             
-            if response.status_code == 200:
+            if response.status_code in [200, 201]:  # Accept both 200 OK and 201 Created
                 data = response.json()
                 if data.get("code") and "data" in data and "token" in data["data"]:
                     _bearer_token = data["data"]["token"]
