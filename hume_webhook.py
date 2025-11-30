@@ -410,10 +410,19 @@ async def get_locations(location_name=None, include_inactive=False):
                 # Check if data contains an institution with locations
                 elif isinstance(data.get("data"), dict):
                     institution_data = data.get("data", {})
-                    if "locations" in institution_data:
+                    print(f"[LOCATIONS DEBUG] Institution data keys: {list(institution_data.keys())}")
+                    print(f"[LOCATIONS DEBUG] Institution name: {institution_data.get('name')}")
+                    print(f"[LOCATIONS DEBUG] Institution ID: {institution_data.get('id')}")
+                    
+                    if "locations" in institution_data and institution_data["locations"]:
+                        # Use the locations INSIDE the institution, not the institution itself
                         locations_data = institution_data["locations"]
+                        print(f"[LOCATIONS] Found {len(locations_data)} location(s) inside institution")
+                        for i, loc in enumerate(locations_data):
+                            print(f"[LOCATIONS DEBUG] Location {i}: {loc.get('name')} (ID: {loc.get('id')})")
                     else:
-                        # Single location object
+                        # Single location object (fallback) - THIS SHOULD NOT HAPPEN FOR INSTITUTIONS
+                        print(f"[LOCATIONS DEBUG] No locations array found, using institution as fallback")
                         locations_data = [institution_data]
                 
                 print(f"[LOCATIONS] Found {len(locations_data)} location(s) in API response")
@@ -433,6 +442,7 @@ async def get_locations(location_name=None, include_inactive=False):
                         location_data = specific_data.get("data", {})
                         if location_data:
                             locations_data = [location_data]
+                            print(f"[LOCATIONS] Using specific location: {location_data.get('name')} (ID: {location_data.get('id')})")
                 
                 # Format locations for voice agent
                 formatted_locations = []
@@ -474,7 +484,8 @@ async def get_locations(location_name=None, include_inactive=False):
                 if formatted_locations:
                     # Log the found location for debugging
                     main_location = formatted_locations[0]
-                    print(f"[LOCATIONS] Found location: {main_location['name']} (ID: {main_location['id']})")
+                    print(f"[LOCATIONS FINAL] Returning location: {main_location['name']} (ID: {main_location['id']})")
+                    print(f"[LOCATIONS FINAL] Expected Green River Dental (ID: 334724)")
                     
                     return {
                         "success": True,
@@ -483,7 +494,41 @@ async def get_locations(location_name=None, include_inactive=False):
                         "total_count": len(formatted_locations)
                     }
                 else:
-                    # No locations found - use fallback
+                    print(f"[LOCATIONS] No formatted locations found, using specific location API call")
+                    # Try to get the specific location we know exists
+                    try:
+                        specific_response = await client.get(
+                            f"{SYNCRONIZER_BASE_URL}/locations/{SYNCRONIZER_LOCATION_ID}",
+                            params=params,
+                            headers=headers,
+                            timeout=10.0
+                        )
+                        
+                        if specific_response.status_code == 200:
+                            specific_data = specific_response.json()
+                            location_data = specific_data.get("data", {})
+                            if location_data and location_data.get("id") == SYNCRONIZER_LOCATION_ID:
+                                formatted_location = {
+                                    "id": location_data.get("id"),
+                                    "name": location_data.get("name", "Green River Dental"),
+                                    "address": location_data.get("street_address", "428 Broadway"),
+                                    "city": location_data.get("city", "New York"),
+                                    "state": location_data.get("state", "NY"),
+                                    "zip_code": location_data.get("zip_code", "10013"),
+                                    "phone": location_data.get("phone_number", "2222222222"),
+                                    "inactive": location_data.get("inactive", False)
+                                }
+                                print(f"[LOCATIONS SPECIFIC] Got correct location: {formatted_location['name']} (ID: {formatted_location['id']})")
+                                return {
+                                    "success": True,
+                                    "message": f"Found location: {formatted_location['name']}",
+                                    "locations": [formatted_location],
+                                    "total_count": 1
+                                }
+                    except Exception as e:
+                        print(f"[LOCATIONS] Error getting specific location: {e}")
+                    
+                    # Final fallback
                     fallback_location = {
                         "id": SYNCRONIZER_LOCATION_ID,
                         "name": "Green River Dental",
@@ -494,6 +539,7 @@ async def get_locations(location_name=None, include_inactive=False):
                         "phone": "2222222222",
                         "inactive": False
                     }
+                    print(f"[LOCATIONS FALLBACK] Using hardcoded location: {fallback_location['name']} (ID: {fallback_location['id']})")
                     
                     return {
                         "success": True,
