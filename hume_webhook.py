@@ -735,10 +735,28 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                 
                 # Format slot results for voice agent
                 formatted_slots = []
-                for slot in slots[:10]:  # Limit to 10 slots for voice interaction
-                    # Parse the slot data
-                    slot_time = slot.get("start_time") or slot.get("time")
-                    provider_info = slot.get("provider", {})
+                
+                # The API returns data like: [{"lid": 334724, "pid": 426683283, "slots": [...]}]
+                # We need to extract the actual slots from each provider group
+                for provider_slot_group in slots:
+                    provider_id = provider_slot_group.get("pid")
+                    location_id = provider_slot_group.get("lid") 
+                    actual_slots = provider_slot_group.get("slots", [])
+                    
+                    # Get provider info for this group
+                    provider_info = {}
+                    if provider_ids and len(provider_ids) == 1:
+                        # Single provider request - we can get provider details
+                        providers_result = await get_providers(location_id=location_id)
+                        if providers_result["success"]:
+                            matching_provider = next((p for p in providers_result["providers"] if p["id"] == provider_id), None)
+                            if matching_provider:
+                                provider_info = matching_provider
+                    
+                    # Process each actual appointment slot
+                    for slot in actual_slots[:10]:  # Limit to 10 slots per provider for voice interaction
+                        # Parse the slot data
+                        slot_time = slot.get("time") or slot.get("start_time")
                     
                     # Format date and time for natural speech
                     if slot_time:
@@ -771,15 +789,24 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                         "provider_id": provider_info.get("id") if isinstance(provider_info, dict) else slot.get("provider_id"),
                         "provider_name": provider_info.get("name") if isinstance(provider_info, dict) else "Available Provider",
                         "location_id": slot.get("location_id", params.get("lids[]", [SYNCRONIZER_LOCATION_ID])[0] if params.get("lids[]") else SYNCRONIZER_LOCATION_ID),
-                        "slot_id": slot.get("id")
+                        "slot_id": slot.get("id"),
+                        "operatory_id": slot.get("operatory_id")
                     }
                     formatted_slots.append(formatted_slot)
+                    
+                    # Break if we have enough slots for voice interaction
+                    if len(formatted_slots) >= 10:
+                        break
+                
+                # Calculate total slots across all providers
+                total_slots = sum(len(group.get("slots", [])) for group in slots)
                 
                 return {
                     "success": True,
-                    "message": f"Found {len(slots)} available appointment slots.",
+                    "message": f"Found {len(formatted_slots)} available appointment slots (showing first 10 of {total_slots} total).",
                     "slots": formatted_slots,
-                    "total_count": len(slots),
+                    "total_count": total_slots,
+                    "displayed_count": len(formatted_slots),
                     "next_available_date": next_available_date
                 }
             
@@ -942,29 +969,36 @@ async def handle_get_providers_tool(control_plane_client: AsyncControlPlaneClien
         # Format response for voice agent
         if result["success"]:
             if result["providers"]:
-                # Format provider list for natural speech
-                provider_list = []
-                for provider in result["providers"]:
-                    provider_info = provider['name']
-                    if provider.get('speciality'):
-                        provider_info += f" ({provider['speciality']})"
-                    if not provider.get('requestable', True):
-                        provider_info += " (not available for online booking)"
-                    provider_list.append(provider_info)
+                # Format provider list for natural speech WITH IDs for booking
+                providers = result["providers"]
                 
-                if len(provider_list) == 1:
-                    response_content = f"I found 1 provider: {provider_list[0]}. Would you like to schedule with this doctor?"
-                elif len(provider_list) <= 5:
-                    response_content = f"I found {len(provider_list)} providers:\n"
-                    for i, provider in enumerate(provider_list, 1):
-                        response_content += f"{i}. {provider}\n"
-                    response_content += "Which doctor would you prefer?"
+                if len(providers) == 1:
+                    provider = providers[0]
+                    response_content = f"I found {provider['name']}."
+                    if provider.get('speciality'):
+                        response_content += f" They specialize in {provider['speciality']}."
+                    response_content += f" Their provider ID is {provider['id']}. Would you like to check their availability?"
+                    
+                elif len(providers) <= 5:
+                    response_content = f"I found {len(providers)} providers:\n"
+                    for provider in providers:
+                        provider_info = f"• {provider['name']} (ID: {provider['id']})"
+                        if provider.get('speciality'):
+                            provider_info += f" - {provider['speciality']}"
+                        if not provider.get('requestable', True):
+                            provider_info += " - Not available for online booking"
+                        response_content += f"{provider_info}\n"
+                    response_content += "To check availability for a specific doctor, use their provider ID when requesting appointment slots."
+                    
                 else:
                     # Show first 5 if many results
-                    response_content = f"I found {len(provider_list)} providers. Here are the first 5:\n"
-                    for i, provider in enumerate(provider_list[:5], 1):
-                        response_content += f"{i}. {provider}\n"
-                    response_content += "Would you like to see more options or choose from these?"
+                    response_content = f"I found {len(providers)} providers. Here are the first 5:\n"
+                    for provider in providers[:5]:
+                        provider_info = f"• {provider['name']} (ID: {provider['id']})"
+                        if provider.get('speciality'):
+                            provider_info += f" - {provider['speciality']}"
+                        response_content += f"{provider_info}\n"
+                    response_content += "To check availability, use the provider ID. Would you like to see more doctors or check availability for one of these?"
             else:
                 if provider_name:
                     response_content = f"I couldn't find a provider named '{provider_name}'. Could you check the spelling or try a different name? I can also show you all available providers."
