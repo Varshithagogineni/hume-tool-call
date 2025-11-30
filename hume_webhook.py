@@ -738,10 +738,12 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                 
                 # The API returns data like: [{"lid": 334724, "pid": 426683283, "slots": [...]}]
                 # We need to extract the actual slots from each provider group
-                for provider_slot_group in slots:
+                print(f"[SLOTS DEBUG] Processing {len(slots)} provider groups")
+                for i, provider_slot_group in enumerate(slots):
                     provider_id = provider_slot_group.get("pid")
                     location_id = provider_slot_group.get("lid") 
                     actual_slots = provider_slot_group.get("slots", [])
+                    print(f"[SLOTS DEBUG] Group {i}: Provider {provider_id}, {len(actual_slots)} slots")
                     
                     # Get provider info for this group
                     provider_info = {}
@@ -754,9 +756,11 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                                 provider_info = matching_provider
                     
                     # Process each actual appointment slot
-                    for slot in actual_slots[:10]:  # Limit to 10 slots per provider for voice interaction
+                    for j, slot in enumerate(actual_slots[:10]):  # Limit to 10 slots per provider for voice interaction
                         # Parse the slot data
                         slot_time = slot.get("time") or slot.get("start_time")
+                        if j < 3:  # Debug first 3 slots
+                            print(f"[SLOTS DEBUG]   Slot {j}: {slot_time} | Raw: {slot}")
                     
                     # Format date and time for natural speech
                     if slot_time:
@@ -800,6 +804,14 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                 
                 # Calculate total slots across all providers
                 total_slots = sum(len(group.get("slots", [])) for group in slots)
+                
+                print(f"[SLOTS FINAL] Formatted {len(formatted_slots)} slots out of {total_slots} total")
+                if formatted_slots:
+                    print(f"[SLOTS FINAL] Sample times: {formatted_slots[0]['friendly_datetime']}")
+                    if len(formatted_slots) > 1:
+                        print(f"[SLOTS FINAL]              {formatted_slots[1]['friendly_datetime']}")
+                    if len(formatted_slots) > 2:
+                        print(f"[SLOTS FINAL]              {formatted_slots[2]['friendly_datetime']}")
                 
                 return {
                     "success": True,
@@ -1091,6 +1103,7 @@ async def handle_get_available_slots_tool(control_plane_client: AsyncControlPlan
         if result["success"]:
             if result["slots"]:
                 slots = result["slots"]
+                print(f"[HANDLER] Formatting {len(slots)} slots for AI response")
                 
                 if len(slots) == 1:
                     slot = slots[0]
@@ -1107,6 +1120,7 @@ async def handle_get_available_slots_tool(control_plane_client: AsyncControlPlan
                             slot_info += f" with {slot['provider_name']}"
                         response_content += f"{slot_info}\n"
                     response_content += "Which appointment time works best for you?"
+                    print(f"[HANDLER] Sending {len(slots)} slots to AI")
                     
                 else:
                     # Show first 5 if many results
@@ -1117,6 +1131,7 @@ async def handle_get_available_slots_tool(control_plane_client: AsyncControlPlan
                             slot_info += f" with {slot['provider_name']}"
                         response_content += f"{slot_info}\n"
                     response_content += "Which time works for you, or would you like to see more options?"
+                    print(f"[HANDLER] Sending first 5 of {len(slots)} total slots to AI")
                     
             else:
                 # No slots available
@@ -1131,6 +1146,7 @@ async def handle_get_available_slots_tool(control_plane_client: AsyncControlPlan
             response_content = f"I encountered an issue while checking availability: {result['message']}"
         
         # Send the result as a tool response
+        print(f"[HANDLER] Sending response to AI: {response_content[:200]}...")
         await control_plane_client.send(
             chat_id=chat_id,
             request=ToolResponseMessage(
