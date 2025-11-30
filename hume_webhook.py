@@ -761,46 +761,49 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                         slot_time = slot.get("time") or slot.get("start_time")
                         if j < 3:  # Debug first 3 slots
                             print(f"[SLOTS DEBUG]   Slot {j}: {slot_time} | Raw: {slot}")
-                    
-                    # Format date and time for natural speech
-                    if slot_time:
-                        try:
-                            from datetime import datetime
-                            # Parse ISO format datetime
-                            dt = datetime.fromisoformat(slot_time.replace('Z', '+00:00'))
-                            # Format for voice: "Tuesday, December 3rd at 2:30 PM"
-                            formatted_date = dt.strftime("%A, %B %d")
-                            # Add ordinal suffix to day
-                            day = dt.day
-                            if 10 <= day % 100 <= 20:
-                                suffix = "th"
-                            else:
-                                suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
-                            formatted_date = formatted_date.replace(f" {day}", f" {day}{suffix}")
-                            
-                            formatted_time = dt.strftime("%I:%M %p").lstrip('0')
-                            friendly_datetime = f"{formatted_date} at {formatted_time}"
-                        except:
-                            # Fallback to raw time if parsing fails
-                            friendly_datetime = slot_time
-                    else:
-                        friendly_datetime = "Time not available"
-                    
-                    formatted_slot = {
-                        "start_time": slot_time,
-                        "friendly_datetime": friendly_datetime,
-                        "duration_minutes": slot.get("duration_minutes", slot.get("duration", 30)),
-                        "provider_id": provider_info.get("id") if isinstance(provider_info, dict) else slot.get("provider_id"),
-                        "provider_name": provider_info.get("name") if isinstance(provider_info, dict) else "Available Provider",
-                        "location_id": slot.get("location_id", params.get("lids[]", [SYNCRONIZER_LOCATION_ID])[0] if params.get("lids[]") else SYNCRONIZER_LOCATION_ID),
-                        "slot_id": slot.get("id"),
-                        "operatory_id": slot.get("operatory_id")
-                    }
-                    formatted_slots.append(formatted_slot)
-                    
-                    # Break if we have enough slots for voice interaction
-                    if len(formatted_slots) >= 10:
-                        break
+                        
+                        # Format date and time for natural speech
+                        if slot_time:
+                            try:
+                                from datetime import datetime
+                                # Parse ISO format datetime
+                                dt = datetime.fromisoformat(slot_time.replace('Z', '+00:00'))
+                                # Format for voice: "Tuesday, December 3rd at 2:30 PM"
+                                formatted_date = dt.strftime("%A, %B %d")
+                                # Add ordinal suffix to day
+                                day = dt.day
+                                if 10 <= day % 100 <= 20:
+                                    suffix = "th"
+                                else:
+                                    suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+                                formatted_date = formatted_date.replace(f" {day}", f" {day}{suffix}")
+                                
+                                formatted_time = dt.strftime("%I:%M %p").lstrip('0')
+                                friendly_datetime = f"{formatted_date} at {formatted_time}"
+                                if j < 3:  # Debug formatting
+                                    print(f"[SLOTS DEBUG]     Formatted: {friendly_datetime}")
+                            except Exception as e:
+                                # Fallback to raw time if parsing fails
+                                friendly_datetime = slot_time
+                                print(f"[SLOTS DEBUG]     Parse error: {e}")
+                        else:
+                            friendly_datetime = "Time not available"
+                        
+                        formatted_slot = {
+                            "start_time": slot_time,
+                            "friendly_datetime": friendly_datetime,
+                            "duration_minutes": slot.get("duration_minutes", slot.get("duration", 30)),
+                            "provider_id": provider_info.get("id") if isinstance(provider_info, dict) else slot.get("provider_id"),
+                            "provider_name": provider_info.get("name") if isinstance(provider_info, dict) else "Available Provider",
+                            "location_id": slot.get("location_id", params.get("lids[]", [SYNCRONIZER_LOCATION_ID])[0] if params.get("lids[]") else SYNCRONIZER_LOCATION_ID),
+                            "slot_id": slot.get("id"),
+                            "operatory_id": slot.get("operatory_id")
+                        }
+                        formatted_slots.append(formatted_slot)
+                        
+                        # Break if we have enough slots for voice interaction
+                        if len(formatted_slots) >= 10:
+                            break
                 
                 # Calculate total slots across all providers
                 total_slots = sum(len(group.get("slots", [])) for group in slots)
