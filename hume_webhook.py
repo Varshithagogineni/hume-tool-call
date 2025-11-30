@@ -400,12 +400,15 @@ async def get_locations(location_name=None, include_inactive=False):
             
             if response.status_code == 200:
                 data = response.json()
+                print(f"[LOCATIONS RAW API] Response data keys: {list(data.keys())}")
+                print(f"[LOCATIONS RAW API] Data type: {type(data.get('data'))}")
                 
                 # Handle different possible API response structures
                 locations_data = []
                 
                 # Check if data is directly an array of locations
                 if isinstance(data.get("data"), list):
+                    print(f"[LOCATIONS] Data is a list, using directly")
                     locations_data = data.get("data", [])
                 # Check if data contains an institution with locations
                 elif isinstance(data.get("data"), dict):
@@ -413,19 +416,28 @@ async def get_locations(location_name=None, include_inactive=False):
                     print(f"[LOCATIONS DEBUG] Institution data keys: {list(institution_data.keys())}")
                     print(f"[LOCATIONS DEBUG] Institution name: {institution_data.get('name')}")
                     print(f"[LOCATIONS DEBUG] Institution ID: {institution_data.get('id')}")
+                    print(f"[LOCATIONS DEBUG] Has locations key: {'locations' in institution_data}")
                     
                     if "locations" in institution_data and institution_data["locations"]:
                         # Use the locations INSIDE the institution, not the institution itself
                         locations_data = institution_data["locations"]
-                        print(f"[LOCATIONS] Found {len(locations_data)} location(s) inside institution")
+                        print(f"[LOCATIONS] ✅ USING LOCATIONS ARRAY: Found {len(locations_data)} location(s) inside institution")
                         for i, loc in enumerate(locations_data):
                             print(f"[LOCATIONS DEBUG] Location {i}: {loc.get('name')} (ID: {loc.get('id')})")
                     else:
-                        # Single location object (fallback) - THIS SHOULD NOT HAPPEN FOR INSTITUTIONS
-                        print(f"[LOCATIONS DEBUG] No locations array found, using institution as fallback")
+                        # ❌ This is the problem - we fall back to using the institution
+                        print(f"[LOCATIONS DEBUG] ❌ FALLBACK: No locations array found or empty, using institution as location")
+                        print(f"[LOCATIONS DEBUG] Institution locations value: {institution_data.get('locations')}")
                         locations_data = [institution_data]
+                else:
+                    print(f"[LOCATIONS] Data is neither list nor dict: {type(data.get('data'))}")
                 
                 print(f"[LOCATIONS] Found {len(locations_data)} location(s) in API response")
+                
+                # DEBUG: Print what we actually got
+                if locations_data:
+                    for i, loc in enumerate(locations_data):
+                        print(f"[LOCATIONS DEBUG RAW] Location {i}: {loc}")
                 
                 # If we didn't find locations in the general endpoint, try using our known location ID
                 if not locations_data:
@@ -447,10 +459,25 @@ async def get_locations(location_name=None, include_inactive=False):
                 # Format locations for voice agent
                 formatted_locations = []
                 
-                for location in locations_data:
+                for i, location in enumerate(locations_data):
+                    print(f"[LOCATIONS FORMAT] Processing item {i}: ID={location.get('id')}, name={location.get('name')}")
+                    
+                    # Check if this looks like a location (ID > 100000) vs institution (ID < 50000)
+                    location_id = location.get("id")
+                    location_name = location.get("name", "Unknown Location")
+                    
+                    if location_id and location_id > 100000:
+                        print(f"[LOCATIONS FORMAT] ✅ LOOKS LIKE LOCATION: {location_name} (ID: {location_id})")
+                    else:
+                        print(f"[LOCATIONS FORMAT] ❌ LOOKS LIKE INSTITUTION: {location_name} (ID: {location_id})")
+                        # Skip institutions - they shouldn't be in our location list
+                        if location_id and location_id < 50000:
+                            print(f"[LOCATIONS FORMAT] Skipping institution {location_name}")
+                            continue
+                    
                     formatted_location = {
-                        "id": location.get("id"),
-                        "name": location.get("name", "Unknown Location"),
+                        "id": location_id,
+                        "name": location_name,
                         "address": location.get("street_address", ""),
                         "city": location.get("city", ""),
                         "state": location.get("state", ""),
@@ -461,9 +488,11 @@ async def get_locations(location_name=None, include_inactive=False):
                     
                     # Skip inactive locations unless requested
                     if not include_inactive and formatted_location["inactive"]:
+                        print(f"[LOCATIONS FORMAT] Skipping inactive location {location_name}")
                         continue
                         
                     formatted_locations.append(formatted_location)
+                    print(f"[LOCATIONS FORMAT] ✅ Added location: {formatted_location['name']} (ID: {formatted_location['id']})")
                 
                 # Filter by location name if specified
                 if location_name and formatted_locations:
