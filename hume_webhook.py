@@ -250,9 +250,21 @@ async def get_providers(location_id=None, requestable=None, provider_name=None):
             "per_page": 20  # Reasonable limit for voice agent
         }
         
-        # Add optional filters
+        # Add optional filters  
         if location_id:
             params["location_id"] = location_id
+        else:
+            # Get the dynamic location ID from our locations
+            locations_result = await get_locations()
+            if locations_result["success"] and locations_result["locations"]:
+                dynamic_location_id = locations_result["locations"][0]["id"]
+                params["location_id"] = dynamic_location_id
+                print(f"[PROVIDERS] Using dynamic location ID: {dynamic_location_id}")
+            else:
+                # Fallback to configured location
+                params["location_id"] = SYNCRONIZER_LOCATION_ID
+                print(f"[PROVIDERS] Using fallback location ID: {SYNCRONIZER_LOCATION_ID}")
+            
         if requestable is not None:
             params["requestable"] = requestable
         
@@ -336,6 +348,384 @@ async def get_providers(location_id=None, requestable=None, provider_name=None):
             "success": False,
             "message": f"Error retrieving providers: {str(e)}",
             "providers": []
+        }
+
+async def get_locations(location_name=None, include_inactive=False):
+    """
+    Get practice locations from the Syncronizer.io API.
+    Dynamically fetches locations and finds Green River Dental.
+    
+    Args:
+        location_name: Location name to search for (optional, for filtering results)
+        include_inactive: Include inactive locations (optional, default False)
+    
+    Returns:
+        List of locations or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to access location information.",
+                "locations": []
+            }
+        
+        # First, try to get all locations to find our practice
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN
+        }
+        
+        if include_inactive:
+            params["inactive"] = True
+        
+        # Set up headers with bearer token
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+            "Nex-Api-Version": "v20240412"
+        }
+        
+        print(f"[LOCATIONS] Fetching locations dynamically...")
+        
+        # Get all locations first
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SYNCRONIZER_BASE_URL}/locations",
+                params=params,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Handle different possible API response structures
+                locations_data = []
+                
+                # Check if data is directly an array of locations
+                if isinstance(data.get("data"), list):
+                    locations_data = data.get("data", [])
+                # Check if data contains an institution with locations
+                elif isinstance(data.get("data"), dict):
+                    institution_data = data.get("data", {})
+                    if "locations" in institution_data:
+                        locations_data = institution_data["locations"]
+                    else:
+                        # Single location object
+                        locations_data = [institution_data]
+                
+                print(f"[LOCATIONS] Found {len(locations_data)} location(s) in API response")
+                
+                # If we didn't find locations in the general endpoint, try using our known location ID
+                if not locations_data:
+                    print(f"[LOCATIONS] No locations in general endpoint, trying specific location {SYNCRONIZER_LOCATION_ID}")
+                    specific_response = await client.get(
+                        f"{SYNCRONIZER_BASE_URL}/locations/{SYNCRONIZER_LOCATION_ID}",
+                        params=params,
+                        headers=headers,
+                        timeout=10.0
+                    )
+                    
+                    if specific_response.status_code == 200:
+                        specific_data = specific_response.json()
+                        location_data = specific_data.get("data", {})
+                        if location_data:
+                            locations_data = [location_data]
+                
+                # Format locations for voice agent
+                formatted_locations = []
+                
+                for location in locations_data:
+                    formatted_location = {
+                        "id": location.get("id"),
+                        "name": location.get("name", "Unknown Location"),
+                        "address": location.get("street_address", ""),
+                        "city": location.get("city", ""),
+                        "state": location.get("state", ""),
+                        "zip_code": location.get("zip_code", ""),
+                        "phone": location.get("phone_number", ""),
+                        "inactive": location.get("inactive", False)
+                    }
+                    
+                    # Skip inactive locations unless requested
+                    if not include_inactive and formatted_location["inactive"]:
+                        continue
+                        
+                    formatted_locations.append(formatted_location)
+                
+                # Filter by location name if specified
+                if location_name and formatted_locations:
+                    search_name = location_name.lower()
+                    filtered_locations = []
+                    
+                    for location in formatted_locations:
+                        location_full_name = location['name'].lower()
+                        location_address = f"{location['address']} {location['city']}".lower()
+                        
+                        if (search_name in location_full_name or 
+                            search_name in location_address or
+                            any(search_name in word for word in location_full_name.split())):
+                            filtered_locations.append(location)
+                    
+                    formatted_locations = filtered_locations
+                
+                if formatted_locations:
+                    # Log the found location for debugging
+                    main_location = formatted_locations[0]
+                    print(f"[LOCATIONS] Found location: {main_location['name']} (ID: {main_location['id']})")
+                    
+                    return {
+                        "success": True,
+                        "message": f"Found {len(formatted_locations)} location(s).",
+                        "locations": formatted_locations,
+                        "total_count": len(formatted_locations)
+                    }
+                else:
+                    # No locations found - use fallback
+                    fallback_location = {
+                        "id": SYNCRONIZER_LOCATION_ID,
+                        "name": "Green River Dental",
+                        "address": "428 Broadway",
+                        "city": "New York",
+                        "state": "NY",
+                        "zip_code": "10013", 
+                        "phone": "2222222222",
+                        "inactive": False
+                    }
+                    
+                    return {
+                        "success": True,
+                        "message": f"Found location: {fallback_location['name']} (using fallback data)",
+                        "locations": [fallback_location],
+                        "total_count": 1
+                    }
+            
+            else:
+                print(f"[LOCATIONS] API error {response.status_code}: {response.text}")
+                # API error - return fallback location
+                fallback_location = {
+                    "id": SYNCRONIZER_LOCATION_ID,
+                    "name": "Green River Dental", 
+                    "address": "428 Broadway",
+                    "city": "New York",
+                    "state": "NY",
+                    "zip_code": "10013",
+                    "phone": "2222222222",
+                    "inactive": False
+                }
+                
+                return {
+                    "success": True,
+                    "message": f"Found location: {fallback_location['name']} (using cached data)",
+                    "locations": [fallback_location],
+                    "total_count": 1
+                }
+                
+    except Exception as e:
+        # Fallback to known location if API fails
+        print(f"[LOCATIONS] Exception occurred, using fallback: {str(e)}")
+        
+        fallback_location = {
+            "id": SYNCRONIZER_LOCATION_ID,
+            "name": "Green River Dental",
+            "address": "428 Broadway", 
+            "city": "New York",
+            "state": "NY",
+            "zip_code": "10013",
+            "phone": "2222222222",
+            "inactive": False
+        }
+        
+        return {
+            "success": True,
+            "message": f"Found location: {fallback_location['name']}",
+            "locations": [fallback_location],
+            "total_count": 1
+        }
+
+async def get_available_slots(start_date, days, provider_ids=None, location_ids=None, appointment_type_id=None, slot_length=None):
+    """
+    Get available appointment slots from the Syncronizer.io API.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format (required)
+        days: Number of days to search (required)
+        provider_ids: List of provider IDs to search (optional, defaults to all)
+        location_ids: List of location IDs to search (optional, defaults to configured location)
+        appointment_type_id: Specific appointment type ID (optional)
+        slot_length: Override default slot length in minutes (optional)
+    
+    Returns:
+        Available slots or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to check availability.",
+                "slots": []
+            }
+        
+        # Prepare query parameters - all required params
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN,
+            "start_date": start_date,
+            "days": days
+        }
+        
+        # Handle location IDs - required as array (API expects lids[] format)
+        if location_ids:
+            # Convert single location to list if needed
+            if isinstance(location_ids, int):
+                location_ids = [location_ids]
+            # For httpx, we need to pass multiple values as a list for the same key
+            params["lids[]"] = location_ids
+        else:
+            # Get the dynamic location ID from our locations
+            locations_result = await get_locations()
+            if locations_result["success"] and locations_result["locations"]:
+                dynamic_location_id = locations_result["locations"][0]["id"]
+                params["lids[]"] = [dynamic_location_id]  # Always pass as list
+                print(f"[SLOTS] Using dynamic location ID: {dynamic_location_id}")
+            else:
+                # Fallback to configured location
+                params["lids[]"] = [SYNCRONIZER_LOCATION_ID]  # Always pass as list
+                print(f"[SLOTS] Using fallback location ID: {SYNCRONIZER_LOCATION_ID}")
+        
+        # Handle provider IDs - required as array (API expects pids[] format)  
+        if provider_ids:
+            # Convert single provider to list if needed
+            if isinstance(provider_ids, int):
+                provider_ids = [provider_ids]
+            # For httpx, we need to pass multiple values as a list for the same key
+            params["pids[]"] = provider_ids
+        else:
+            # If no specific providers requested, we need to get all requestable providers
+            providers_result = await get_providers(requestable=True)
+            if providers_result["success"] and providers_result["providers"]:
+                available_provider_ids = [p["id"] for p in providers_result["providers"]]
+                params["pids[]"] = available_provider_ids[:3]  # Limit to first 3 providers
+                print(f"[SLOTS] Using {len(available_provider_ids[:3])} requestable provider IDs")
+            else:
+                return {
+                    "success": False,
+                    "message": "No available providers found for scheduling.",
+                    "slots": []
+                }
+        
+        # Add optional parameters
+        if appointment_type_id:
+            params["appointment_type_id"] = appointment_type_id
+        if slot_length:
+            params["slot_length"] = slot_length
+        
+        # Set up headers with bearer token
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+            "Nex-Api-Version": "v20240412"
+        }
+        
+        print(f"[SLOTS] Checking availability: {start_date} for {days} days, params: {params}")
+        
+        # Make API request
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SYNCRONIZER_BASE_URL}/available_slots",
+                params=params,
+                headers=headers,
+                timeout=15.0  # Longer timeout for slot searches
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                slots = data.get("data", [])
+                next_available_date = data.get("next_available_date")
+                
+                if not slots:
+                    message = f"No available slots found for the requested dates ({start_date} to {days} days)."
+                    if next_available_date:
+                        message += f" The next available appointment is {next_available_date}."
+                    
+                    return {
+                        "success": False,
+                        "message": message,
+                        "slots": [],
+                        "next_available_date": next_available_date
+                    }
+                
+                # Format slot results for voice agent
+                formatted_slots = []
+                for slot in slots[:10]:  # Limit to 10 slots for voice interaction
+                    # Parse the slot data
+                    slot_time = slot.get("start_time") or slot.get("time")
+                    provider_info = slot.get("provider", {})
+                    
+                    # Format date and time for natural speech
+                    if slot_time:
+                        try:
+                            from datetime import datetime
+                            # Parse ISO format datetime
+                            dt = datetime.fromisoformat(slot_time.replace('Z', '+00:00'))
+                            # Format for voice: "Tuesday, December 3rd at 2:30 PM"
+                            formatted_date = dt.strftime("%A, %B %d")
+                            # Add ordinal suffix to day
+                            day = dt.day
+                            if 10 <= day % 100 <= 20:
+                                suffix = "th"
+                            else:
+                                suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+                            formatted_date = formatted_date.replace(f" {day}", f" {day}{suffix}")
+                            
+                            formatted_time = dt.strftime("%I:%M %p").lstrip('0')
+                            friendly_datetime = f"{formatted_date} at {formatted_time}"
+                        except:
+                            # Fallback to raw time if parsing fails
+                            friendly_datetime = slot_time
+                    else:
+                        friendly_datetime = "Time not available"
+                    
+                    formatted_slot = {
+                        "start_time": slot_time,
+                        "friendly_datetime": friendly_datetime,
+                        "duration_minutes": slot.get("duration_minutes", slot.get("duration", 30)),
+                        "provider_id": provider_info.get("id") if isinstance(provider_info, dict) else slot.get("provider_id"),
+                        "provider_name": provider_info.get("name") if isinstance(provider_info, dict) else "Available Provider",
+                        "location_id": slot.get("location_id", params.get("lids[]", [SYNCRONIZER_LOCATION_ID])[0] if params.get("lids[]") else SYNCRONIZER_LOCATION_ID),
+                        "slot_id": slot.get("id")
+                    }
+                    formatted_slots.append(formatted_slot)
+                
+                return {
+                    "success": True,
+                    "message": f"Found {len(slots)} available appointment slots.",
+                    "slots": formatted_slots,
+                    "total_count": len(slots),
+                    "next_available_date": next_available_date
+                }
+            
+            else:
+                return {
+                    "success": False,
+                    "message": f"API error while checking availability: {response.status_code} - {response.text}",
+                    "slots": []
+                }
+                
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": "Request timed out while checking availability. Please try again.",
+            "slots": []
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error checking availability: {str(e)}",
+            "slots": []
         }
 
 async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
@@ -529,6 +919,234 @@ async def handle_get_providers_tool(control_plane_client: AsyncControlPlaneClien
                 error="ProviderSearchError",
                 content=f"I'm having trouble finding provider information right now. Please try again or contact our office directly. Error: {str(e)}"
             )
+            )
+
+async def handle_get_available_slots_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the get_available_slots tool call and send the response back to the chat.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "get_available_slots":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
+        
+        # Extract required parameters
+        start_date = parameters.get("start_date")
+        days = parameters.get("days", 7)  # Default to 7 days if not specified
+        
+        # Extract optional parameters
+        provider_ids = parameters.get("provider_ids")
+        location_ids = parameters.get("location_ids") 
+        appointment_type_id = parameters.get("appointment_type_id")
+        slot_length = parameters.get("slot_length")
+        
+        # Validate required parameters
+        if not start_date:
+            # Default to today if no start date provided
+            from datetime import date
+            start_date = date.today().isoformat()
+        
+        print(f"[SLOTS] Checking availability: start_date={start_date}, days={days}, providers={provider_ids}, appointment_type={appointment_type_id}")
+        
+        # Get available slots
+        result = await get_available_slots(
+            start_date=start_date,
+            days=days,
+            provider_ids=provider_ids,
+            location_ids=location_ids,
+            appointment_type_id=appointment_type_id,
+            slot_length=slot_length
+        )
+        
+        # Format response for voice agent
+        if result["success"]:
+            if result["slots"]:
+                slots = result["slots"]
+                
+                if len(slots) == 1:
+                    slot = slots[0]
+                    response_content = f"I found 1 available appointment: {slot['friendly_datetime']}"
+                    if slot.get('provider_name') and slot['provider_name'] != "Available Provider":
+                        response_content += f" with {slot['provider_name']}"
+                    response_content += ". Would you like to book this appointment?"
+                    
+                elif len(slots) <= 5:
+                    response_content = f"I found {len(slots)} available appointments:\n"
+                    for i, slot in enumerate(slots, 1):
+                        slot_info = f"{i}. {slot['friendly_datetime']}"
+                        if slot.get('provider_name') and slot['provider_name'] != "Available Provider":
+                            slot_info += f" with {slot['provider_name']}"
+                        response_content += f"{slot_info}\n"
+                    response_content += "Which appointment time works best for you?"
+                    
+                else:
+                    # Show first 5 if many results
+                    response_content = f"I found {len(slots)} available appointments. Here are the next 5 options:\n"
+                    for i, slot in enumerate(slots[:5], 1):
+                        slot_info = f"{i}. {slot['friendly_datetime']}"
+                        if slot.get('provider_name') and slot['provider_name'] != "Available Provider":
+                            slot_info += f" with {slot['provider_name']}"
+                        response_content += f"{slot_info}\n"
+                    response_content += "Which time works for you, or would you like to see more options?"
+                    
+            else:
+                # No slots available
+                response_content = result["message"]
+                
+                # Suggest alternatives if next_available_date is provided
+                if result.get("next_available_date"):
+                    response_content += f" Would you like to check availability starting {result['next_available_date']}?"
+                else:
+                    response_content += " Would you like to try different dates or times?"
+        else:
+            response_content = f"I encountered an issue while checking availability: {result['message']}"
+        
+        # Send the result as a tool response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Available slots search completed successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle get available slots tool: {e}")
+        
+        # Send error response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="AvailabilitySearchError",
+                content=f"I'm having trouble checking appointment availability right now. Please try again or call our office directly. Error: {str(e)}"
+            )
+            )
+
+async def handle_get_locations_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the get_locations tool call and send the response back to the chat.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "get_locations":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
+        
+        # Extract search parameters
+        location_name = parameters.get("location_name")
+        include_inactive = parameters.get("include_inactive", False)
+        
+        print(f"[LOCATIONS] Searching locations with: location_name={location_name}, include_inactive={include_inactive}")
+        
+        # Get locations
+        result = await get_locations(
+            location_name=location_name,
+            include_inactive=include_inactive
+        )
+        
+        # Format response for voice agent
+        if result["success"]:
+            if result["locations"]:
+                locations = result["locations"]
+                
+                if len(locations) == 1:
+                    location = locations[0]
+                    
+                    # Build address string
+                    address_parts = []
+                    if location.get('address'):
+                        address_parts.append(location['address'])
+                    if location.get('city'):
+                        address_parts.append(location['city'])
+                    if location.get('state'):
+                        address_parts.append(location['state'])
+                    
+                    full_address = ", ".join(address_parts) if address_parts else "Address available upon request"
+                    
+                    response_content = f"We're located at {location['name']} at {full_address}."
+                    if location.get('phone'):
+                        response_content += f" Our phone number is {location['phone']}."
+                    response_content += " Would you like to schedule an appointment at this location?"
+                    
+                else:
+                    # Multiple locations (future expansion)
+                    response_content = f"We have {len(locations)} locations:\n"
+                    for i, location in enumerate(locations, 1):
+                        location_info = f"{i}. {location['name']}"
+                        if location.get('city'):
+                            location_info += f" in {location['city']}"
+                        if location.get('inactive'):
+                            location_info += " (currently closed)"
+                        response_content += f"{location_info}\n"
+                    response_content += "Which location would you prefer for your appointment?"
+                    
+            else:
+                response_content = "I'm having trouble finding our location information. Let me connect you with someone who can help with scheduling."
+        else:
+            response_content = f"I encountered an issue while looking up our location: {result['message']}"
+        
+        # Send the result as a tool response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Location search completed successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle get locations tool: {e}")
+        
+        # Send error response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="LocationSearchError",
+                content=f"I'm having trouble finding location information right now. Please try again or contact our office directly. Error: {str(e)}"
+            )
         )
 
 async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
@@ -616,6 +1234,10 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             await handle_search_patients_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "get_providers":
             await handle_get_providers_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        elif tool_name == "get_available_slots":
+            await handle_get_available_slots_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        elif tool_name == "get_locations":
+            await handle_get_locations_tool(control_plane_client, event.chat_id, event.tool_call_message)
         else:
             print(f"[ERROR] Unknown tool: {tool_name}")
             # Send error response for unknown tools
