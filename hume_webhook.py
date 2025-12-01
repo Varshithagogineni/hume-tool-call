@@ -733,11 +733,18 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                         "next_available_date": next_available_date
                     }
                 
-                # Format slot results for voice agent
+                # Format slot results for voice agent - SEND ALL SLOTS TO AI
                 formatted_slots = []
                 
+                # Get ALL provider info upfront for name mapping
+                providers_result = await get_providers()
+                provider_name_map = {}
+                if providers_result["success"]:
+                    for p in providers_result["providers"]:
+                        provider_name_map[p["id"]] = p["name"]
+                
                 # The API returns data like: [{"lid": 334724, "pid": 426683283, "slots": [...]}]
-                # We need to extract the actual slots from each provider group
+                # We need to extract ALL actual slots from each provider group
                 print(f"[SLOTS DEBUG] Processing {len(slots)} provider groups")
                 for i, provider_slot_group in enumerate(slots):
                     provider_id = provider_slot_group.get("pid")
@@ -745,21 +752,14 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                     actual_slots = provider_slot_group.get("slots", [])
                     print(f"[SLOTS DEBUG] Group {i}: Provider {provider_id}, {len(actual_slots)} slots")
                     
-                    # Get provider info for this group
-                    provider_info = {}
-                    if provider_ids and len(provider_ids) == 1:
-                        # Single provider request - we can get provider details
-                        providers_result = await get_providers(location_id=location_id)
-                        if providers_result["success"]:
-                            matching_provider = next((p for p in providers_result["providers"] if p["id"] == provider_id), None)
-                            if matching_provider:
-                                provider_info = matching_provider
+                    # Get provider name from our map
+                    provider_name = provider_name_map.get(provider_id, "Available Provider")
                     
-                    # Process each actual appointment slot
-                    for j, slot in enumerate(actual_slots[:10]):  # Limit to 10 slots per provider for voice interaction
+                    # Process ALL actual appointment slots (no limits!)
+                    for j, slot in enumerate(actual_slots):
                         # Parse the slot data
                         slot_time = slot.get("time") or slot.get("start_time")
-                        if j < 3:  # Debug first 3 slots
+                        if j < 3:  # Debug first 3 slots only
                             print(f"[SLOTS DEBUG]   Slot {j}: {slot_time} | Raw: {slot}")
                         
                         # Format date and time for natural speech
@@ -793,34 +793,34 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                             "start_time": slot_time,
                             "friendly_datetime": friendly_datetime,
                             "duration_minutes": slot.get("duration_minutes", slot.get("duration", 30)),
-                            "provider_id": provider_info.get("id") if isinstance(provider_info, dict) else slot.get("provider_id"),
-                            "provider_name": provider_info.get("name") if isinstance(provider_info, dict) else "Available Provider",
-                            "location_id": slot.get("location_id", params.get("lids[]", [SYNCRONIZER_LOCATION_ID])[0] if params.get("lids[]") else SYNCRONIZER_LOCATION_ID),
+                            "provider_id": provider_id,
+                            "provider_name": provider_name,  # Now properly populated!
+                            "location_id": location_id,
                             "slot_id": slot.get("id"),
                             "operatory_id": slot.get("operatory_id")
                         }
                         formatted_slots.append(formatted_slot)
                         
-                        # Break if we have enough slots for voice interaction
-                        if len(formatted_slots) >= 10:
-                            break
+                        # NO LIMITS! Send all slots to AI for intelligent filtering
                 
                 # Calculate total slots across all providers
                 total_slots = sum(len(group.get("slots", [])) for group in slots)
                 
-                print(f"[SLOTS  FINAL] Formatted {len(formatted_slots)} slots out of {total_slots} total")
+                print(f"[SLOTS  FINAL] Formatted ALL {len(formatted_slots)} slots (was {total_slots} total from API)")
                 if formatted_slots:
-                    print(f"[SLOTS FINAL] Sample times: {formatted_slots[0]['friendly_datetime']}")
+                    print(f"[SLOTS FINAL] Sample times: {formatted_slots[0]['friendly_datetime']} ({formatted_slots[0]['provider_name']})")
                     if len(formatted_slots) > 1:
-                        print(f"[SLOTS FINAL]              {formatted_slots[1]['friendly_datetime']}")
+                        print(f"[SLOTS FINAL]              {formatted_slots[1]['friendly_datetime']} ({formatted_slots[1]['provider_name']})")
                     if len(formatted_slots) > 2:
-                        print(f"[SLOTS FINAL]              {formatted_slots[2]['friendly_datetime']}")
+                        print(f"[SLOTS FINAL]              {formatted_slots[2]['friendly_datetime']} ({formatted_slots[2]['provider_name']})")
+                    print(f"[SLOTS FINAL] Total providers: {len(set(s['provider_name'] for s in formatted_slots))}")
+                    print(f"[SLOTS FINAL] Time range: {formatted_slots[0]['friendly_datetime'].split(' at ')[1]} to {formatted_slots[-1]['friendly_datetime'].split(' at ')[1]}")
   
                 return {
                     "success": True,
-                    "message": f"Found {len(formatted_slots)} available appointment slots (showing first 10 of {total_slots} total).",
+                    "message": f"Found {len(formatted_slots)} available appointment slots across all providers and times.",
                     "slots": formatted_slots,
-                    "total_count": total_slots,
+                    "total_count": len(formatted_slots),
                     "displayed_count": len(formatted_slots),
                     "next_available_date": next_available_date
                 }
