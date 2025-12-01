@@ -808,14 +808,14 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
                 # Calculate total slots across all providers
                 total_slots = sum(len(group.get("slots", [])) for group in slots)
                 
-                print(f"[SLOTS FINAL] Formatted {len(formatted_slots)} slots out of {total_slots} total")
+                print(f"[SLOTS  FINAL] Formatted {len(formatted_slots)} slots out of {total_slots} total")
                 if formatted_slots:
                     print(f"[SLOTS FINAL] Sample times: {formatted_slots[0]['friendly_datetime']}")
                     if len(formatted_slots) > 1:
                         print(f"[SLOTS FINAL]              {formatted_slots[1]['friendly_datetime']}")
                     if len(formatted_slots) > 2:
                         print(f"[SLOTS FINAL]              {formatted_slots[2]['friendly_datetime']}")
-                
+  
                 return {
                     "success": True,
                     "message": f"Found {len(formatted_slots)} available appointment slots (showing first 10 of {total_slots} total).",
@@ -1108,33 +1108,41 @@ async def handle_get_available_slots_tool(control_plane_client: AsyncControlPlan
                 slots = result["slots"]
                 print(f"[HANDLER] Formatting {len(slots)} slots for AI response")
                 
-                if len(slots) == 1:
-                    slot = slots[0]
-                    response_content = f"I found 1 available appointment: {slot['friendly_datetime']}"
-                    if slot.get('provider_name') and slot['provider_name'] != "Available Provider":
-                        response_content += f" with {slot['provider_name']}"
-                    response_content += ". Would you like to book this appointment?"
-                    
-                elif len(slots) <= 5:
-                    response_content = f"I found {len(slots)} available appointments:\n"
-                    for i, slot in enumerate(slots, 1):
-                        slot_info = f"{i}. {slot['friendly_datetime']}"
+                # Send ALL slots to AI and let it intelligently filter and present them
+                response_content = f"Available appointment slots ({len(slots)} total):\n\n"
+                
+                # Group slots by date for better organization
+                slots_by_date = {}
+                for slot in slots:
+                    # Extract date from friendly_datetime (e.g., "Thursday, December 05 at 9:00 AM")
+                    date_part = slot['friendly_datetime'].split(' at ')[0] if ' at ' in slot['friendly_datetime'] else "Unknown Date"
+                    if date_part not in slots_by_date:
+                        slots_by_date[date_part] = []
+                    slots_by_date[date_part].append(slot)
+                
+                # Format all slots organized by date
+                for date, date_slots in slots_by_date.items():
+                    response_content += f"{date}:\n"
+                    for slot in date_slots:
+                        time_part = slot['friendly_datetime'].split(' at ')[1] if ' at ' in slot['friendly_datetime'] else slot['friendly_datetime']
+                        slot_info = f"- {time_part}"
                         if slot.get('provider_name') and slot['provider_name'] != "Available Provider":
-                            slot_info += f" with {slot['provider_name']}"
+                            slot_info += f" (Dr. {slot['provider_name'].replace('Dr. ', '')})"
                         response_content += f"{slot_info}\n"
-                    response_content += "Which appointment time works best for you?"
-                    print(f"[HANDLER] Sending {len(slots)} slots to AI")
-                    
-                else:
-                    # Show first 5 if many results
-                    response_content = f"I found {len(slots)} available appointments. Here are the next 5 options:\n"
-                    for i, slot in enumerate(slots[:5], 1):
-                        slot_info = f"{i}. {slot['friendly_datetime']}"
-                        if slot.get('provider_name') and slot['provider_name'] != "Available Provider":
-                            slot_info += f" with {slot['provider_name']}"
-                        response_content += f"{slot_info}\n"
-                    response_content += "Which time works for you, or would you like to see more options?"
-                    print(f"[HANDLER] Sending first 5 of {len(slots)} total slots to AI")
+                    response_content += "\n"
+                
+                # Instructions for AI to handle user preferences intelligently
+                response_content += """INSTRUCTIONS: Based on the user's request, please:
+1. If they asked for specific times (morning/afternoon/evening), filter and present only those relevant times
+2. If they requested a specific doctor, show only that doctor's availability  
+3. If they made a general request, present 5-8 diverse time options throughout the day
+4. Always mention the doctor's name when presenting specific slots
+5. Keep your response concise for voice conversation (under 30 seconds when spoken)
+6. If showing multiple options, ask which time works best for them
+
+Morning = 9:00 AM - 12:00 PM, Afternoon = 12:00 PM - 5:00 PM, Evening = 4:00 PM - 6:00 PM"""
+
+                print(f"[HANDLER] Sending ALL {len(slots)} slots to AI for intelligent filtering")
                     
             else:
                 # No slots available
