@@ -222,6 +222,163 @@ async def search_patients(name=None, phone_number=None, email=None, date_of_birt
             "patients": []
         }
 
+async def create_patient(first_name, last_name, date_of_birth, gender, email, phone_number, middle_name=None, address=None):
+    """
+    Create a new patient in the Syncronizer.io system.
+    
+    Args:
+        first_name: Patient's first name (required)
+        last_name: Patient's last name (required)
+        date_of_birth: Patient's DOB in YYYY-MM-DD format (required)
+        gender: Patient's gender - 'male', 'female', or 'other' (required)
+        email: Patient's email address (required)
+        phone_number: Patient's phone number (required)
+        middle_name: Patient's middle name (optional)
+        address: Patient's address dict with street_address, city, state, zip_code (optional)
+    
+    Returns:
+        Created patient data or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to create patient record.",
+                "patient": None
+            }
+        
+        # Clean phone number (remove spaces, dashes, parentheses)
+        clean_phone = ''.join(filter(str.isdigit, phone_number))
+        
+        # Map gender to capitalized format (Male/Female/Other)
+        gender_map = {
+            "male": "Male",
+            "female": "Female",
+            "other": "Other",
+            "m": "Male",
+            "f": "Female",
+            "o": "Other"
+        }
+        gender_code = gender_map.get(gender.lower(), "Other")
+        
+        # Get a default provider ID - we'll fetch the first available provider
+        # This is required by the API for patient creation
+        providers_result = await get_providers(location_id=SYNCRONIZER_LOCATION_ID)
+        provider_id = None
+        if providers_result["success"] and providers_result["providers"]:
+            provider_id = providers_result["providers"][0]["id"]
+            print(f"[CREATE PATIENT] Using provider ID: {provider_id}")
+        
+        # Build request body with proper nested structure
+        # The API expects: patient[field], patient[bio][field], and provider[provider_id] format
+        form_data = {
+            "patient[first_name]": first_name,
+            "patient[last_name]": last_name,
+            "patient[email]": email,
+            "patient[bio][date_of_birth]": date_of_birth,
+            "patient[bio][phone_number]": clean_phone,
+            "patient[bio][gender]": gender_code
+        }
+        
+        # Add provider if available
+        if provider_id:
+            form_data["provider[provider_id]"] = str(provider_id)
+        
+        # Add optional fields
+        if middle_name:
+            form_data["patient[middle_name]"] = middle_name
+        
+        if address and isinstance(address, dict):
+            if address.get("street_address"):
+                form_data["patient[bio][street_address]"] = address["street_address"]
+            if address.get("city"):
+                form_data["patient[bio][city]"] = address["city"]
+            if address.get("state"):
+                form_data["patient[bio][state]"] = address["state"]
+            if address.get("zip_code"):
+                form_data["patient[bio][zip_code]"] = address["zip_code"]
+        
+        # Prepare query parameters - location_id is required
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN,
+            "location_id": SYNCRONIZER_LOCATION_ID
+        }
+        
+        # Set up headers with bearer token
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+            "Nex-Api-Version": "v20240412"
+        }
+        
+        print(f"[CREATE PATIENT] Creating patient: {first_name} {last_name}, DOB: {date_of_birth}, Gender: {gender}")
+        print(f"[CREATE PATIENT] Form data keys: {list(form_data.keys())}")
+        
+        # Make API request with form data
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SYNCRONIZER_BASE_URL}/patients",
+                params=params,
+                data=form_data,  # Use form data instead of JSON
+                headers=headers,
+                timeout=10.0
+            )
+            
+            print(f"[CREATE PATIENT] Response status: {response.status_code}")
+            
+            if response.status_code in [200, 201]:
+                data = response.json()
+                print(f"[CREATE PATIENT] Response received successfully")
+                
+                # Patient data is nested under data.user
+                patient = data.get("data", {}).get("user", {})
+                bio = patient.get("bio", {}) if isinstance(patient.get("bio"), dict) else {}
+                
+                # Format patient info for voice response
+                formatted_patient = {
+                    "id": patient.get("id"),
+                    "name": patient.get("name") or f"{patient.get('first_name', '')} {patient.get('last_name', '')}".strip(),
+                    "first_name": patient.get("first_name"),
+                    "last_name": patient.get("last_name"),
+                    "date_of_birth": bio.get("date_of_birth"),
+                    "gender": bio.get("gender"),
+                    "phone": bio.get("phone_number"),
+                    "email": patient.get("email")
+                }
+                print(f"[CREATE PATIENT] Patient created: ID={formatted_patient['id']}, Name={formatted_patient['name']}")
+                
+                return {
+                    "success": True,
+                    "message": f"Successfully created patient record for {formatted_patient['name']}.",
+                    "patient": formatted_patient
+                }
+            
+            else:
+                error_detail = response.text
+                print(f"[CREATE PATIENT ERROR] {response.status_code}: {error_detail}")
+                return {
+                    "success": False,
+                    "message": f"Failed to create patient. API error: {response.status_code}",
+                    "patient": None,
+                    "error_detail": error_detail
+                }
+                
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": "Request timed out while creating patient. Please try again.",
+            "patient": None
+        }
+    except Exception as e:
+        print(f"[CREATE PATIENT EXCEPTION] {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error creating patient: {str(e)}",
+            "patient": None
+        }
+
 async def get_providers(location_id=None, requestable=None, provider_name=None):
     """
     Get providers (doctors, dentists, hygienists) from the Syncronizer.io API.
@@ -938,6 +1095,140 @@ async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneCli
             )
             )
 
+async def handle_create_patient_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the create_patient tool call and send the response back to the chat.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "create_patient":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
+        
+        # Extract required parameters
+        first_name = parameters.get("first_name")
+        last_name = parameters.get("last_name")
+        date_of_birth = parameters.get("date_of_birth")
+        gender = parameters.get("gender")
+        email = parameters.get("email")
+        phone_number = parameters.get("phone_number")
+        
+        # Extract optional parameters
+        middle_name = parameters.get("middle_name")
+        
+        # Handle address if provided
+        address = parameters.get("address")
+        if address and isinstance(address, str):
+            # If address is a string, try to parse it as JSON
+            try:
+                address = json.loads(address)
+            except:
+                # If parsing fails, create a simple dict with street_address
+                address = {"street_address": address}
+        
+        print(f"[CREATE] Creating patient: {first_name} {last_name}, DOB: {date_of_birth}, Gender: {gender}")
+        
+        # Validate required fields
+        if not all([first_name, last_name, date_of_birth, gender, email, phone_number]):
+            missing_fields = []
+            if not first_name:
+                missing_fields.append("first name")
+            if not last_name:
+                missing_fields.append("last name")
+            if not date_of_birth:
+                missing_fields.append("date of birth")
+            if not gender:
+                missing_fields.append("gender")
+            if not email:
+                missing_fields.append("email")
+            if not phone_number:
+                missing_fields.append("phone number")
+            
+            error_msg = f"I need the following information to create a patient record: {', '.join(missing_fields)}. Could you please provide that?"
+            await control_plane_client.send(
+                chat_id=chat_id,
+                request=ToolResponseMessage(
+                    tool_call_id=tool_call_id,
+                    content=error_msg
+                )
+            )
+            return
+        
+        # Create the patient
+        result = await create_patient(
+            first_name=first_name,
+            last_name=last_name,
+            date_of_birth=date_of_birth,
+            gender=gender,
+            email=email,
+            phone_number=phone_number,
+            middle_name=middle_name,
+            address=address
+        )
+        
+        # Format response for voice agent
+        if result["success"]:
+            patient = result["patient"]
+            response_content = f"Great! I've successfully created a patient record for {patient['name']}"
+            
+            # Add confirmation details
+            details = []
+            if patient.get('date_of_birth'):
+                details.append(f"date of birth {patient['date_of_birth']}")
+            if patient.get('phone'):
+                details.append(f"phone number {patient['phone']}")
+            if patient.get('email'):
+                details.append(f"email {patient['email']}")
+            
+            if details:
+                response_content += f" with {', '.join(details)}"
+            
+            response_content += f". The patient ID is {patient['id']}. Would you like to schedule an appointment for {patient['name']}?"
+        else:
+            response_content = f"I encountered an issue while creating the patient record: {result['message']}. Please try again or contact our office for assistance."
+        
+        # Send the result as a tool response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Patient creation completed successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle create patient tool: {e}")
+        
+        # Send error response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="PatientCreationError",
+                content=f"I'm having trouble creating the patient record right now. Please try again or contact our office directly. Error: {str(e)}"
+            )
+        )
+
 async def handle_get_providers_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
     """
     Handle the get_providers tool call and send the response back to the chat.
@@ -1360,6 +1651,8 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             await handle_dad_joke_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "search_patients":
             await handle_search_patients_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        elif tool_name == "create_patient":
+            await handle_create_patient_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "get_providers":
             await handle_get_providers_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "get_available_slots":
