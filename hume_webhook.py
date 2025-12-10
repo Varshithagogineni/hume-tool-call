@@ -393,6 +393,249 @@ async def create_patient(first_name, last_name, date_of_birth, gender, email, ph
             "patient": None
         }
 
+async def get_operatories(location_id=None):
+    """
+    Get operatories (treatment rooms/chairs) from the Syncronizer.io API.
+    
+    Args:
+        location_id: Filter by specific location (optional)
+    
+    Returns:
+        List of operatories or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to access operatory information.",
+                "operatories": []
+            }
+        
+        # Prepare query parameters
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN,
+            "per_page": 50  # Get all operatories
+        }
+        
+        # Add location filter
+        if location_id:
+            params["location_id"] = location_id
+        else:
+            params["location_id"] = SYNCRONIZER_LOCATION_ID
+        
+        # Set up headers
+        headers = {
+            "Accept": "application/vnd.Nexhealth+json;version=2",
+            "Authorization": f"Bearer {bearer_token}"
+        }
+        
+        print(f"[OPERATORIES] Fetching operatories for location {params['location_id']}")
+        
+        # Make API request
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SYNCRONIZER_BASE_URL}/operatories",
+                params=params,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            print(f"[OPERATORIES] Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                operatories_data = data.get("data", [])
+                
+                # Format operatories for easier use
+                operatories = []
+                for op in operatories_data:
+                    # Only include active and bookable operatories
+                    if op.get("active", False) and op.get("bookable_online", False):
+                        operatories.append({
+                            "id": op.get("id"),
+                            "name": op.get("name"),
+                            "display_name": op.get("display_name"),
+                            "location_id": op.get("location_id")
+                        })
+                
+                print(f"[OPERATORIES] Found {len(operatories)} active bookable operatories")
+                
+                return {
+                    "success": True,
+                    "message": f"Found {len(operatories)} operatories",
+                    "operatories": operatories
+                }
+            else:
+                error_detail = response.text
+                print(f"[OPERATORIES ERROR] {response.status_code}: {error_detail}")
+                return {
+                    "success": False,
+                    "message": f"Failed to get operatories. API error: {response.status_code}",
+                    "operatories": []
+                }
+                
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": "Request timed out while fetching operatories.",
+            "operatories": []
+        }
+    except Exception as e:
+        print(f"[OPERATORIES EXCEPTION] {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error fetching operatories: {str(e)}",
+            "operatories": []
+        }
+
+async def book_appointment(patient_id, provider_id, start_time, end_time=None, appointment_type_id=None, operatory_id=None, note=None, notify_patient=True):
+    """
+    Book/create an appointment in the NexHealth system.
+    
+    Args:
+        patient_id: ID of the patient (required)
+        provider_id: ID of the provider (required)
+        start_time: Appointment start time in ISO format (required) e.g., "2024-12-15T14:30:00Z"
+        end_time: Appointment end time in ISO format (optional, will be calculated if not provided)
+        appointment_type_id: ID of appointment type (optional)
+        operatory_id: ID of operatory/treatment room (optional but required by some locations)
+        note: Notes about the appointment (optional)
+        notify_patient: Whether to send notification to patient (default: True)
+    
+    Returns:
+        Created appointment data or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to book appointment.",
+                "appointment": None
+            }
+        
+        # If no operatory_id provided, try to get one automatically
+        if not operatory_id:
+            print(f"[BOOK APPOINTMENT] No operatory_id provided, fetching available operatories...")
+            operatories_result = await get_operatories(location_id=SYNCRONIZER_LOCATION_ID)
+            if operatories_result["success"] and operatories_result["operatories"]:
+                operatory_id = operatories_result["operatories"][0]["id"]
+                print(f"[BOOK APPOINTMENT] Using operatory ID: {operatory_id}")
+            else:
+                print(f"[BOOK APPOINTMENT WARNING] Could not fetch operatory, proceeding without it")
+        
+        # Build appointment request body
+        appt_data = {
+            "patient_id": int(patient_id),
+            "provider_id": int(provider_id),
+            "start_time": start_time
+        }
+        
+        # Add optional fields
+        if end_time:
+            appt_data["end_time"] = end_time
+        
+        if appointment_type_id:
+            appt_data["appointment_type_id"] = int(appointment_type_id)
+        
+        if operatory_id:
+            appt_data["operatory_id"] = int(operatory_id)
+        
+        if note:
+            appt_data["note"] = note
+        
+        # Build complete request body
+        request_body = {
+            "appt": appt_data
+        }
+        
+        # Prepare query parameters
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN,
+            "location_id": SYNCRONIZER_LOCATION_ID,
+            "notify_patient": str(notify_patient).lower()
+        }
+        
+        # Set up headers
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.Nexhealth+json;version=2",
+            "Authorization": f"Bearer {bearer_token}"
+        }
+        
+        print(f"[BOOK APPOINTMENT] Creating appointment for patient {patient_id} with provider {provider_id}")
+        print(f"[BOOK APPOINTMENT] Start time: {start_time}")
+        print(f"[BOOK APPOINTMENT] Request body: {request_body}")
+        
+        # Make API request
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SYNCRONIZER_BASE_URL}/appointments",
+                params=params,
+                json=request_body,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            print(f"[BOOK APPOINTMENT] Response status: {response.status_code}")
+            
+            if response.status_code in [200, 201]:
+                data = response.json()
+                print(f"[BOOK APPOINTMENT] Response received successfully")
+                
+                # Appointment data is nested under data.appt
+                appointment = data.get("data", {}).get("appt", {})
+                patient_data = appointment.get("patient", {})
+                
+                # Format appointment info for voice response
+                formatted_appointment = {
+                    "id": appointment.get("id"),
+                    "patient_id": appointment.get("patient_id"),
+                    "patient_name": patient_data.get("name", ""),
+                    "provider_id": appointment.get("provider_id"),
+                    "provider_name": appointment.get("provider_name", ""),
+                    "start_time": appointment.get("start_time"),
+                    "end_time": appointment.get("end_time"),
+                    "confirmed": appointment.get("confirmed", False),
+                    "note": appointment.get("note", ""),
+                    "location_id": appointment.get("location_id")
+                }
+                
+                print(f"[BOOK APPOINTMENT] Appointment created: ID={formatted_appointment['id']}, Start={formatted_appointment['start_time']}")
+                
+                return {
+                    "success": True,
+                    "message": f"Successfully booked appointment for {formatted_appointment['patient_name']} with {formatted_appointment['provider_name']} at {formatted_appointment['start_time']}.",
+                    "appointment": formatted_appointment
+                }
+            
+            else:
+                error_detail = response.text
+                print(f"[BOOK APPOINTMENT ERROR] {response.status_code}: {error_detail}")
+                return {
+                    "success": False,
+                    "message": f"Failed to book appointment. API error: {response.status_code}",
+                    "appointment": None,
+                    "error_detail": error_detail
+                }
+                
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": "Request timed out while booking appointment. Please try again.",
+            "appointment": None
+        }
+    except Exception as e:
+        print(f"[BOOK APPOINTMENT EXCEPTION] {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error booking appointment: {str(e)}",
+            "appointment": None
+        }
+
 async def get_providers(location_id=None, requestable=None, provider_name=None):
     """
     Get providers (doctors, dentists, hygienists) from the Syncronizer.io API.
@@ -1582,6 +1825,125 @@ async def handle_get_locations_tool(control_plane_client: AsyncControlPlaneClien
             )
         )
 
+async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the book_appointment tool call and send the response back to the chat.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "book_appointment":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
+        
+        # Extract required parameters
+        patient_id = parameters.get("patient_id")
+        provider_id = parameters.get("provider_id")
+        start_time = parameters.get("start_time")
+        
+        # Extract optional parameters
+        end_time = parameters.get("end_time")
+        appointment_type_id = parameters.get("appointment_type_id")
+        operatory_id = parameters.get("operatory_id")
+        note = parameters.get("note")
+        notify_patient = parameters.get("notify_patient", True)
+        
+        print(f"[BOOK APPOINTMENT] Patient: {patient_id}, Provider: {provider_id}, Start: {start_time}")
+        
+        # Validate required fields
+        if not all([patient_id, provider_id, start_time]):
+            missing_fields = []
+            if not patient_id:
+                missing_fields.append("patient ID")
+            if not provider_id:
+                missing_fields.append("provider ID")
+            if not start_time:
+                missing_fields.append("start time")
+            
+            error_msg = f"I need the following information to book the appointment: {', '.join(missing_fields)}. Could you please provide that?"
+            await control_plane_client.send(
+                chat_id=chat_id,
+                request=ToolResponseMessage(
+                    tool_call_id=tool_call_id,
+                    content=error_msg
+                )
+            )
+            return
+        
+        # Book the appointment
+        result = await book_appointment(
+            patient_id=patient_id,
+            provider_id=provider_id,
+            start_time=start_time,
+            end_time=end_time,
+            appointment_type_id=appointment_type_id,
+            operatory_id=operatory_id,
+            note=note,
+            notify_patient=notify_patient
+        )
+        
+        # Format response for voice agent
+        if result["success"]:
+            appointment = result["appointment"]
+            
+            # Parse and format the start time for voice
+            from datetime import datetime
+            try:
+                dt = datetime.fromisoformat(appointment['start_time'].replace('Z', '+00:00'))
+                formatted_time = dt.strftime("%A, %B %d at %I:%M %p")
+            except:
+                formatted_time = appointment['start_time']
+            
+            response_content = f"Great! I've booked your appointment with {appointment['provider_name']} for {formatted_time}."
+            
+            if appointment.get('note'):
+                response_content += f" Note: {appointment['note']}"
+            
+            response_content += " You should receive a confirmation shortly. Is there anything else I can help you with?"
+        else:
+            response_content = f"I'm sorry, I had trouble booking that appointment. {result['message']} Would you like to try a different time or provider?"
+        
+        # Send the result as a tool response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Appointment booking completed successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle book appointment tool: {e}")
+        
+        # Send error response
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="AppointmentBookingError",
+                content=f"I'm having trouble booking the appointment right now. Please try again or contact our office directly at our main number. Error: {str(e)}"
+            )
+        )
+
 async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
     """
     Handle the tell_dad_joke tool call and send the response back to the chat.
@@ -1673,6 +2035,8 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             await handle_get_available_slots_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "get_locations":
             await handle_get_locations_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        elif tool_name == "book_appointment":
+            await handle_book_appointment_tool(control_plane_client, event.chat_id, event.tool_call_message)
         else:
             print(f"[ERROR] Unknown tool: {tool_name}")
             # Send error response for unknown tools
