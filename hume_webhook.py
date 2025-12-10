@@ -271,34 +271,47 @@ async def create_patient(first_name, last_name, date_of_birth, gender, email, ph
             provider_id = providers_result["providers"][0]["id"]
             print(f"[CREATE PATIENT] Using provider ID: {provider_id}")
         
-        # Build request body with proper nested structure
-        # The API expects: patient[field], patient[bio][field], and provider[provider_id] format
-        form_data = {
-            "patient[first_name]": first_name,
-            "patient[last_name]": last_name,
-            "patient[email]": email,
-            "patient[bio][date_of_birth]": date_of_birth,
-            "patient[bio][phone_number]": clean_phone,
-            "patient[bio][gender]": gender_code
+        # Build request body with proper nested JSON structure
+        # The API expects proper JSON with nested objects
+        bio_data = {
+            "date_of_birth": date_of_birth,
+            "phone_number": clean_phone,
+            "gender": gender_code
+        }
+        
+        # Add optional address fields to bio
+        if address and isinstance(address, dict):
+            if address.get("street_address"):
+                bio_data["street_address"] = address["street_address"]
+            if address.get("city"):
+                bio_data["city"] = address["city"]
+            if address.get("state"):
+                bio_data["state"] = address["state"]
+            if address.get("zip_code"):
+                bio_data["zip_code"] = address["zip_code"]
+        
+        # Build patient object
+        patient_data = {
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": email,
+            "bio": bio_data
+        }
+        
+        # Add optional middle name
+        if middle_name:
+            patient_data["middle_name"] = middle_name
+        
+        # Build complete request body
+        request_body = {
+            "patient": patient_data
         }
         
         # Add provider if available
         if provider_id:
-            form_data["provider[provider_id]"] = str(provider_id)
-        
-        # Add optional fields
-        if middle_name:
-            form_data["patient[middle_name]"] = middle_name
-        
-        if address and isinstance(address, dict):
-            if address.get("street_address"):
-                form_data["patient[bio][street_address]"] = address["street_address"]
-            if address.get("city"):
-                form_data["patient[bio][city]"] = address["city"]
-            if address.get("state"):
-                form_data["patient[bio][state]"] = address["state"]
-            if address.get("zip_code"):
-                form_data["patient[bio][zip_code]"] = address["zip_code"]
+            request_body["provider"] = {
+                "provider_id": int(provider_id)
+            }
         
         # Prepare query parameters - location_id is required
         params = {
@@ -307,21 +320,22 @@ async def create_patient(first_name, last_name, date_of_birth, gender, email, ph
         }
         
         # Set up headers with bearer token
+        # API expects Accept header in format: application/vnd.Nexhealth+json;version=2
         headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {bearer_token}",
-            "Nex-Api-Version": "v20240412"
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.Nexhealth+json;version=2",
+            "Authorization": f"Bearer {bearer_token}"
         }
         
         print(f"[CREATE PATIENT] Creating patient: {first_name} {last_name}, DOB: {date_of_birth}, Gender: {gender}")
-        print(f"[CREATE PATIENT] Form data keys: {list(form_data.keys())}")
+        print(f"[CREATE PATIENT] Request body: {request_body}")
         
-        # Make API request with form data
+        # Make API request with JSON body
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{SYNCRONIZER_BASE_URL}/patients",
                 params=params,
-                data=form_data,  # Use form data instead of JSON
+                json=request_body,  # Use JSON instead of form data
                 headers=headers,
                 timeout=10.0
             )
