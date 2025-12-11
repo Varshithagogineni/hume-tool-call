@@ -13,6 +13,7 @@ from hume.empathic_voice.types import (
     WebhookEventToolCall
 )
 from hume.empathic_voice import ToolCallMessage, ToolErrorMessage, ToolResponseMessage
+from hume.core.api_error import ApiError
 import uvicorn
 import httpx
 
@@ -35,6 +36,38 @@ _token_expires_at = None
 # Instantiate the Hume clients
 client = AsyncHumeClient(api_key=HUME_API_KEY)
 control_plane_client = AsyncControlPlaneClient(client_wrapper=client._client_wrapper)
+
+# Helper function to safely send messages to control plane
+async def safe_send_to_control_plane(control_plane_client: AsyncControlPlaneClient, chat_id: str, message):
+    """
+    Safely send a message to the control plane, handling chat unavailability errors.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        message: The message to send (ToolResponseMessage or ToolErrorMessage)
+    
+    Returns:
+        bool: True if sent successfully, False if chat is unavailable
+    """
+    try:
+        await control_plane_client.send(
+            chat_id=chat_id,
+            request=message
+        )
+        return True
+    except ApiError as e:
+        # Handle chat unavailability gracefully
+        if e.status_code == 400 and 'chat_unavailable' in str(e.body).lower():
+            print(f"[WARNING] Chat {chat_id} is no longer available. Skipping response.")
+            return False
+        else:
+            # Re-raise other API errors
+            print(f"[ERROR] API Error while sending to control plane: {e}")
+            raise
+    except Exception as e:
+        print(f"[ERROR] Unexpected error sending to control plane: {e}")
+        raise
 
 # Dad joke generator
 def get_dad_joke():
@@ -1330,9 +1363,10 @@ async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneCli
             response_content = f"I encountered an issue while searching for patients: {result['message']}"
         
         # Send the result as a tool response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolResponseMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
                 tool_call_id=tool_call_id,
                 content=response_content
             )
@@ -1343,9 +1377,10 @@ async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneCli
         print(f"[ERROR] Failed to handle search patients tool: {e}")
         
         # Send error response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolErrorMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
                 tool_call_id=tool_call_id,
                 error="PatientSearchError",
                 content=f"I'm having trouble searching for patients right now. Please try again or contact our office directly. Error: {str(e)}"
@@ -1421,9 +1456,10 @@ async def handle_create_patient_tool(control_plane_client: AsyncControlPlaneClie
                 missing_fields.append("phone number")
             
             error_msg = f"I need the following information to create a patient record: {', '.join(missing_fields)}. Could you please provide that?"
-            await control_plane_client.send(
-                chat_id=chat_id,
-                request=ToolResponseMessage(
+            await safe_send_to_control_plane(
+                control_plane_client,
+                chat_id,
+                ToolResponseMessage(
                     tool_call_id=tool_call_id,
                     content=error_msg
                 )
@@ -1464,9 +1500,10 @@ async def handle_create_patient_tool(control_plane_client: AsyncControlPlaneClie
             response_content = f"I encountered an issue while creating the patient record: {result['message']}. Please try again or contact our office for assistance."
         
         # Send the result as a tool response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolResponseMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
                 tool_call_id=tool_call_id,
                 content=response_content
             )
@@ -1477,9 +1514,10 @@ async def handle_create_patient_tool(control_plane_client: AsyncControlPlaneClie
         print(f"[ERROR] Failed to handle create patient tool: {e}")
         
         # Send error response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolErrorMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
                 tool_call_id=tool_call_id,
                 error="PatientCreationError",
                 content=f"I'm having trouble creating the patient record right now. Please try again or contact our office directly. Error: {str(e)}"
@@ -1571,9 +1609,10 @@ async def handle_get_providers_tool(control_plane_client: AsyncControlPlaneClien
             response_content = f"I encountered an issue while looking up providers: {result['message']}"
         
         # Send the result as a tool response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolResponseMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
                 tool_call_id=tool_call_id,
                 content=response_content
             )
@@ -1584,9 +1623,10 @@ async def handle_get_providers_tool(control_plane_client: AsyncControlPlaneClien
         print(f"[ERROR] Failed to handle get providers tool: {e}")
         
         # Send error response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolErrorMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
                 tool_call_id=tool_call_id,
                 error="ProviderSearchError",
                 content=f"I'm having trouble finding provider information right now. Please try again or contact our office directly. Error: {str(e)}"
@@ -1698,9 +1738,10 @@ async def handle_get_available_slots_tool(control_plane_client: AsyncControlPlan
         
         # Send the result as a tool response
         print(f"[HANDLER] Sending response to AI: {response_content[:200]}...")
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolResponseMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
                 tool_call_id=tool_call_id,
                 content=response_content
             )
@@ -1711,9 +1752,10 @@ async def handle_get_available_slots_tool(control_plane_client: AsyncControlPlan
         print(f"[ERROR] Failed to handle get available slots tool: {e}")
         
         # Send error response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolErrorMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
                 tool_call_id=tool_call_id,
                 error="AvailabilitySearchError",
                 content=f"I'm having trouble checking appointment availability right now. Please try again or call our office directly. Error: {str(e)}"
@@ -1803,9 +1845,10 @@ async def handle_get_locations_tool(control_plane_client: AsyncControlPlaneClien
             response_content = f"I encountered an issue while looking up our location: {result['message']}"
         
         # Send the result as a tool response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolResponseMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
                 tool_call_id=tool_call_id,
                 content=response_content
             )
@@ -1816,9 +1859,10 @@ async def handle_get_locations_tool(control_plane_client: AsyncControlPlaneClien
         print(f"[ERROR] Failed to handle get locations tool: {e}")
         
         # Send error response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolErrorMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
                 tool_call_id=tool_call_id,
                 error="LocationSearchError",
                 content=f"I'm having trouble finding location information right now. Please try again or contact our office directly. Error: {str(e)}"
@@ -1879,9 +1923,10 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
                 missing_fields.append("start time")
             
             error_msg = f"I need the following information to book the appointment: {', '.join(missing_fields)}. Could you please provide that?"
-            await control_plane_client.send(
-                chat_id=chat_id,
-                request=ToolResponseMessage(
+            await safe_send_to_control_plane(
+                control_plane_client,
+                chat_id,
+                ToolResponseMessage(
                     tool_call_id=tool_call_id,
                     content=error_msg
                 )
@@ -1922,9 +1967,10 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
             response_content = f"I'm sorry, I had trouble booking that appointment. {result['message']} Would you like to try a different time or provider?"
         
         # Send the result as a tool response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolResponseMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
                 tool_call_id=tool_call_id,
                 content=response_content
             )
@@ -1935,9 +1981,10 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
         print(f"[ERROR] Failed to handle book appointment tool: {e}")
         
         # Send error response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolErrorMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
                 tool_call_id=tool_call_id,
                 error="AppointmentBookingError",
                 content=f"I'm having trouble booking the appointment right now. Please try again or contact our office directly at our main number. Error: {str(e)}"
@@ -1969,9 +2016,10 @@ async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, ch
         print(f"[JOKE] Generated joke: {joke}")
         
         # Send the joke as a tool response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolResponseMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
                 tool_call_id=tool_call_id,
                 content=joke
             )
@@ -1982,9 +2030,10 @@ async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, ch
         print(f"[ERROR] Failed to handle dad joke tool: {e}")
         
         # Send error response
-        await control_plane_client.send(
-            chat_id=chat_id,
-            request=ToolErrorMessage(
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
                 tool_call_id=tool_call_id,
                 error="DadJokeError",
                 content=f"Sorry, I couldn't generate a dad joke right now: {str(e)}"
@@ -2040,9 +2089,10 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
         else:
             print(f"[ERROR] Unknown tool: {tool_name}")
             # Send error response for unknown tools
-            await control_plane_client.send(
-                chat_id=event.chat_id,
-                request=ToolErrorMessage(
+            await safe_send_to_control_plane(
+                control_plane_client,
+                event.chat_id,
+                ToolErrorMessage(
                     tool_call_id=event.tool_call_message.tool_call_id,
                     error="UnknownTool",
                     content=f"I don't know how to use the {tool_name} tool. Please contact support."
