@@ -219,8 +219,10 @@ async def search_patients(name=None, phone_number=None, email=None, date_of_birt
                 # Format patient results for voice agent
                 formatted_patients = []
                 for patient in patients[:5]:  # Limit to 5 results for voice
+                    patient_id = patient.get("id")
+                    print(f"[SEARCH DEBUG] Raw patient data - ID: {patient_id}, First: {patient.get('first_name')}, Last: {patient.get('last_name')}")
                     formatted_patient = {
-                        "id": patient.get("id"),
+                        "id": patient_id,
                         "name": f"{patient.get('first_name', '')} {patient.get('last_name', '')}".strip(),
                         "phone": patient.get("phone_number"),
                         "email": patient.get("email"),
@@ -1340,24 +1342,45 @@ async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneCli
         # Format response for voice agent
         if result["success"]:
             if result["patients"]:
-                # Format patient list for natural speech
+                print(f"[SEARCH] Found {len(result['patients'])} patient(s)")
+                # Format patient list for natural speech INCLUDING patient ID
                 patient_list = []
                 for patient in result["patients"]:
-                    patient_info = f"{patient['name']}"
+                    # CRITICAL: Include patient ID so AI can use it for booking
+                    patient_id = patient.get('id', 'UNKNOWN')
+                    patient_name = patient.get('name', 'Unknown Name')
+                    
+                    print(f"[SEARCH] Processing patient - ID: {patient_id}, Name: {patient_name}")
+                    
+                    if patient_id == 'UNKNOWN' or patient_id is None:
+                        print(f"[SEARCH WARNING] Patient has no ID! Full patient data: {patient}")
+                    
+                    patient_info = f"{patient_name} (Patient ID: {patient_id}"
                     if patient.get('phone'):
-                        patient_info += f" (phone: {patient['phone']})"
+                        patient_info += f", phone: {patient['phone']}"
                     if patient.get('date_of_birth'):
-                        patient_info += f" (DOB: {patient['date_of_birth']})"
+                        patient_info += f", DOB: {patient['date_of_birth']}"
+                    patient_info += ")"
                     patient_list.append(patient_info)
+                    print(f"[SEARCH] Formatted: {patient_info}")
                 
                 if len(patient_list) == 1:
-                    response_content = f"I found 1 patient: {patient_list[0]}. Is this the correct patient?"
+                    # Single patient found - be VERY explicit about the patient ID
+                    patient = result["patients"][0]
+                    patient_id = patient.get('id', 'UNKNOWN')
+                    response_content = f"I found 1 patient: {patient_list[0]}. "
+                    response_content += f"The patient ID is {patient_id}. "
+                    response_content += f"Please use this patient ID {patient_id} when booking an appointment. "
+                    response_content += f"Is this the correct patient for booking?"
                 else:
+                    # Multiple patients - list them with explicit IDs
                     response_content = f"I found {len(patient_list)} patients:\n"
-                    for i, patient in enumerate(patient_list, 1):
-                        response_content += f"{i}. {patient}\n"
+                    for i, (patient_info, patient) in enumerate(zip(patient_list, result["patients"]), 1):
+                        patient_id = patient.get('id', 'UNKNOWN')
+                        response_content += f"{i}. {patient_info} - Use Patient ID: {patient_id} for booking\n"
                     response_content += "Which patient would you like to select?"
             else:
+                print(f"[SEARCH] No patients found matching the search criteria")
                 response_content = "I couldn't find any patients matching your search. Could you please verify the spelling of the name, or try providing a phone number or date of birth?"
         else:
             response_content = f"I encountered an issue while searching for patients: {result['message']}"
@@ -1964,7 +1987,12 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
             
             response_content += " You should receive a confirmation shortly. Is there anything else I can help you with?"
         else:
-            response_content = f"I'm sorry, I had trouble booking that appointment. {result['message']} Would you like to try a different time or provider?"
+            # Check if the error is related to invalid patient ID
+            error_detail = result.get('error_detail', '')
+            if 'Patient with id' in error_detail and 'not found' in error_detail:
+                response_content = f"I'm sorry, I couldn't find that patient record. Please search for the patient first using their name, phone number, or date of birth before booking an appointment."
+            else:
+                response_content = f"I'm sorry, I had trouble booking that appointment. {result['message']} Would you like to try a different time or provider?"
         
         # Send the result as a tool response
         await safe_send_to_control_plane(
