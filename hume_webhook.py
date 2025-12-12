@@ -792,6 +792,154 @@ async def book_appointment(patient_id, provider_id, start_time, end_time=None, a
             "appointment": None
         }
 
+async def reschedule_appointment(appointment_id, start_time=None, end_time=None, provider_id=None, operatory_id=None, note=None, cancelled=False, confirmed=None, notify_patient=True):
+    """
+    Reschedule or edit an existing appointment in the Syncronizer.io API.
+    
+    Args:
+        appointment_id: The ID of the appointment to edit (required)
+        start_time: New start time in timezone-aware format (e.g., "2025-12-12T09:30:00.000-05:00")
+        end_time: New end time (optional)
+        provider_id: New provider ID (optional)
+        operatory_id: New operatory ID (optional)
+        note: Updated note for the appointment (optional)
+        cancelled: Set to True to cancel the appointment (default: False)
+        confirmed: Set appointment confirmation status (optional)
+        notify_patient: Whether to send notification to patient (default: True)
+    
+    Returns:
+        Updated appointment details or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to reschedule appointment.",
+                "appointment": None
+            }
+        
+        # Build the appointment update data
+        appt_data = {}
+        
+        if start_time is not None:
+            appt_data["start_time"] = start_time
+        
+        if end_time is not None:
+            appt_data["end_time"] = end_time
+        
+        if provider_id is not None:
+            appt_data["provider_id"] = int(provider_id)
+        
+        if operatory_id is not None:
+            appt_data["operatory_id"] = int(operatory_id)
+        
+        if note is not None:
+            appt_data["note"] = note
+        
+        if cancelled is not None:
+            appt_data["cancelled"] = cancelled
+        
+        if confirmed is not None:
+            appt_data["confirmed"] = confirmed
+        
+        # Validate we have something to update
+        if not appt_data:
+            return {
+                "success": False,
+                "message": "No fields specified for update",
+                "appointment": None
+            }
+        
+        # Build complete request body
+        request_body = {
+            "appt": appt_data
+        }
+        
+        # Prepare query parameters
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN
+        }
+        
+        # Set up headers
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.Nexhealth+json;version=2",
+            "Authorization": f"Bearer {bearer_token}"
+        }
+        
+        print(f"[RESCHEDULE APPOINTMENT] Updating appointment ID: {appointment_id}")
+        print(f"[RESCHEDULE APPOINTMENT] Updates: {appt_data}")
+        
+        # Make API request (PATCH)
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SYNCRONIZER_BASE_URL}/appointments/{appointment_id}",
+                params=params,
+                json=request_body,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            print(f"[RESCHEDULE APPOINTMENT] Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                print(f"[RESCHEDULE APPOINTMENT] Appointment updated successfully")
+                
+                # Appointment data is nested under data.appt
+                appointment = data.get("data", {}).get("appt", {})
+                
+                return {
+                    "success": True,
+                    "message": "Appointment updated successfully",
+                    "appointment": {
+                        "id": appointment.get("id"),
+                        "patient_id": appointment.get("patient_id"),
+                        "provider_id": appointment.get("provider_id"),
+                        "provider_name": appointment.get("provider_name"),
+                        "start_time": appointment.get("start_time"),
+                        "end_time": appointment.get("end_time"),
+                        "timezone": appointment.get("timezone"),
+                        "note": appointment.get("note"),
+                        "confirmed": appointment.get("confirmed"),
+                        "cancelled": appointment.get("cancelled"),
+                        "location_id": appointment.get("location_id"),
+                        "operatory_id": appointment.get("operatory_id"),
+                        "created_at": appointment.get("created_at"),
+                        "updated_at": appointment.get("updated_at")
+                    }
+                }
+            else:
+                error_data = response.json()
+                error_messages = error_data.get("error", [])
+                error_text = ", ".join(error_messages) if isinstance(error_messages, list) else str(error_messages)
+                
+                print(f"[RESCHEDULE APPOINTMENT ERROR] {response.status_code}: {response.text}")
+                
+                return {
+                    "success": False,
+                    "message": f"Failed to update appointment: {error_text}",
+                    "error_detail": error_text,
+                    "appointment": None
+                }
+    
+    except httpx.TimeoutException:
+        print(f"[RESCHEDULE APPOINTMENT TIMEOUT] Request timed out")
+        return {
+            "success": False,
+            "message": "Request timed out while updating appointment. Please try again.",
+            "appointment": None
+        }
+    except Exception as e:
+        print(f"[RESCHEDULE APPOINTMENT EXCEPTION] {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error updating appointment: {str(e)}",
+            "appointment": None
+        }
+
 async def get_providers(location_id=None, requestable=None, provider_name=None):
     """
     Get providers (doctors, dentists, hygienists) from the Syncronizer.io API.
@@ -2295,6 +2443,141 @@ async def handle_get_patient_appointments_tool(control_plane_client: AsyncContro
             )
         )
 
+async def handle_reschedule_appointment_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the reschedule_appointment tool call and send the response back to the chat.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "reschedule_appointment":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
+        
+        # Extract parameters
+        appointment_id = parameters.get("appointment_id")
+        start_time = parameters.get("start_time")
+        end_time = parameters.get("end_time")
+        provider_id = parameters.get("provider_id")
+        operatory_id = parameters.get("operatory_id")
+        note = parameters.get("note")
+        cancelled = parameters.get("cancelled", False)
+        confirmed = parameters.get("confirmed")
+        notify_patient = parameters.get("notify_patient", True)
+        
+        print(f"[RESCHEDULE] Appointment ID: {appointment_id}, New Start: {start_time}, Cancelled: {cancelled}")
+        
+        # Validate required fields
+        if not appointment_id:
+            error_msg = "I need an appointment ID to reschedule. Please provide the appointment ID."
+            await safe_send_to_control_plane(
+                control_plane_client,
+                chat_id,
+                ToolResponseMessage(
+                    tool_call_id=tool_call_id,
+                    content=error_msg
+                )
+            )
+            return
+        
+        # Reschedule the appointment
+        result = await reschedule_appointment(
+            appointment_id=appointment_id,
+            start_time=start_time,
+            end_time=end_time,
+            provider_id=provider_id,
+            operatory_id=operatory_id,
+            note=note,
+            cancelled=cancelled,
+            confirmed=confirmed,
+            notify_patient=notify_patient
+        )
+        
+        # Format response for voice agent
+        if result["success"]:
+            appointment = result["appointment"]
+            
+            # Determine what action was performed
+            if cancelled:
+                response_content = f"I've cancelled the appointment successfully."
+                if appointment.get('provider_name'):
+                    response_content += f" Your appointment with {appointment['provider_name']} has been cancelled."
+                response_content += " Is there anything else I can help you with?"
+            else:
+                # Parse and format the start time for voice
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+                
+                try:
+                    dt_utc = datetime.fromisoformat(appointment['start_time'].replace('Z', '+00:00'))
+                    appt_timezone = appointment.get('timezone', 'America/New_York')
+                    dt_local = dt_utc.astimezone(ZoneInfo(appt_timezone))
+                    formatted_time = dt_local.strftime("%A, %B %d at %I:%M %p %Z")
+                except:
+                    formatted_time = appointment['start_time']
+                
+                provider_name = appointment.get('provider_name', 'your provider')
+                
+                response_content = f"Perfect! I've rescheduled your appointment to {formatted_time} with {provider_name}."
+                
+                if appointment.get('note'):
+                    response_content += f" Note: {appointment['note']}"
+                
+                response_content += " You should receive a confirmation shortly. Is there anything else I can help you with?"
+        else:
+            # Handle different error scenarios
+            error_detail = result.get('error_detail', '')
+            
+            if 'not found' in error_detail.lower():
+                response_content = "I'm sorry, I couldn't find that appointment. Could you provide the appointment ID again or check your appointments?"
+            elif 'not available' in error_detail.lower():
+                response_content = f"I'm sorry, that time slot is no longer available. Would you like to try a different time?"
+            else:
+                response_content = f"I'm sorry, I had trouble rescheduling that appointment. {result['message']} Would you like to try again or choose a different option?"
+        
+        # Send the result as a tool response
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Appointment reschedule completed successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle reschedule appointment tool: {e}")
+        
+        # Send error response
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="AppointmentRescheduleError",
+                content=f"I'm having trouble rescheduling the appointment right now. Please try again or contact our office directly. Error: {str(e)}"
+            )
+        )
+
 async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
     """
     Handle the tell_dad_joke tool call and send the response back to the chat.
@@ -2392,6 +2675,8 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             await handle_book_appointment_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "get_patient_appointments":
             await handle_get_patient_appointments_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        elif tool_name == "reschedule_appointment":
+            await handle_reschedule_appointment_tool(control_plane_client, event.chat_id, event.tool_call_message)
         else:
             print(f"[ERROR] Unknown tool: {tool_name}")
             # Send error response for unknown tools
