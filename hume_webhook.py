@@ -2627,13 +2627,26 @@ async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, ch
             )
         )
 
+@app.get("/")
+async def root():
+    """Root endpoint - confirms webhook is running."""
+    return JSONResponse({
+        "status": "running",
+        "service": "Hume EVI Dental Assistant Webhook",
+        "version": "1.0.0",
+        "endpoints": {
+            "webhook": "/hume-webhook",
+            "health": "/health"
+        }
+    })
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
     return JSONResponse({
         "status": "ok", 
-        "service": "Hume EVI Dad Joke Webhook",
-        "webhook_url": "https://pitchy-incomprehendingly-dianne.ngrok-free.dev/hume-webhook"
+        "service": "Hume EVI Dental Assistant Webhook",
+        "timestamp": time.time()
     })
 
 @app.post("/hume-webhook")
