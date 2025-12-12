@@ -1,20 +1,18 @@
-# This file re-exports the FastAPI app from hume_webhook.py
-# Vercel looks for 'app' in api/index.py
-
+"""
+Vercel serverless entry point for Hume webhook
+This file properly imports the FastAPI app for Vercel deployment
+"""
 import sys
 import os
 
-# Add parent directory to path to enable imports
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add the parent directory to Python path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
 
-# Now we can import from the hume-tool-call directory
-# We use exec to handle the hyphenated directory name
-webhook_file = os.path.join(os.path.dirname(__file__), '..', 'hume-tool-call', 'hume_webhook.py')
+# Import the FastAPI app
+# Since hume_webhook.py is in the parent directory, we can import it directly
+import hume_webhook
 
-# Read and execute the webhook file
-with open(webhook_file, 'r', encoding='utf-8') as f:
-    code = f.read()
-    exec(code, globals())
-
-# The 'app' variable is now available from the executed code
-
+# Export the app variable for Vercel
+app = hume_webhook.app
