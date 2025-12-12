@@ -2113,7 +2113,36 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
             if 'Patient with id' in error_detail and 'not found' in error_detail:
                 response_content = f"I'm sorry, I couldn't find that patient record. Please search for the patient first using their name, phone number, or date of birth before booking an appointment."
             else:
-                response_content = f"I'm sorry, I had trouble booking that appointment. {result['message']} Would you like to try a different time or provider?"
+                # When booking fails, automatically check for existing appointments
+                print(f"[BOOK APPOINTMENT] Booking failed, checking existing appointments for patient {patient_id}")
+                existing_appts = await get_patient_appointments(patient_id=patient_id)
+                
+                if existing_appts["success"] and existing_appts["appointments"]:
+                    # Found existing appointments - inform the user
+                    from datetime import datetime
+                    from zoneinfo import ZoneInfo
+                    
+                    appointments = existing_appts["appointments"]
+                    response_content = f"I'm sorry, that time slot is no longer available. "
+                    
+                    if len(appointments) == 1:
+                        appt = appointments[0]
+                        try:
+                            dt_utc = datetime.fromisoformat(appt['start_time'].replace('Z', '+00:00'))
+                            appt_timezone = appt.get('timezone', 'America/New_York')
+                            dt_local = dt_utc.astimezone(ZoneInfo(appt_timezone))
+                            formatted_time = dt_local.strftime("%A, %B %d at %I:%M %p %Z")
+                        except:
+                            formatted_time = appt['start_time']
+                        
+                        response_content += f"However, I see you already have an appointment scheduled for {formatted_time} with {appt['provider_name']}. "
+                        response_content += "Would you like to keep that appointment, reschedule it, or book an additional appointment?"
+                    else:
+                        response_content += f"However, I see you have {len(appointments)} appointments already scheduled. "
+                        response_content += "Would you like me to review your existing appointments, or try booking a different time?"
+                else:
+                    # No existing appointments found
+                    response_content = f"I'm sorry, I had trouble booking that appointment. {result['message']} Would you like to try a different time or provider?"
         
         # Send the result as a tool response
         await safe_send_to_control_plane(
