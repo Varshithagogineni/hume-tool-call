@@ -1,6 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 hume==0.13.5
-starlette==0.38.6
-httpx==0.25.2
-supabase==2.3.4
+starlette
+httpx
+supabase
