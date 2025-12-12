@@ -2,6 +2,8 @@ import os
 import random
 import json
 import time
+from datetime import datetime
+from contextvars import ContextVar
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
 from hume.client import AsyncHumeClient
@@ -16,6 +18,7 @@ from hume.empathic_voice import ToolCallMessage, ToolErrorMessage, ToolResponseM
 from hume.core.api_error import ApiError
 import uvicorn
 import httpx
+from supabase import create_client, Client
 
 # FastAPI app instance
 app = FastAPI()
@@ -36,6 +39,26 @@ _token_expires_at = None
 # Instantiate the Hume clients
 client = AsyncHumeClient(api_key=HUME_API_KEY)
 control_plane_client = AsyncControlPlaneClient(client_wrapper=client._client_wrapper)
+
+# Supabase client for event logging
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://bxwtazqgyhcurgeornox.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_FqOfee969k0OUF_OTTA3wg_taFkQ4oZ")
+supabase_client: Client = None
+
+# Initialize Supabase client if credentials are provided
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("[SUPABASE] Client initialized successfully")
+    except Exception as e:
+        print(f"[SUPABASE ERROR] Failed to initialize client: {e}")
+        supabase_client = None
+else:
+    print("[SUPABASE WARNING] No credentials found - logging disabled")
+
+# Context variables for tracking current tool call (for API logging)
+_current_chat_id: ContextVar[str] = ContextVar('current_chat_id', default=None)
+_current_tool_call_id: ContextVar[str] = ContextVar('current_tool_call_id', default=None)
 
 # Helper function to safely send messages to control plane
 async def safe_send_to_control_plane(control_plane_client: AsyncControlPlaneClient, chat_id: str, message):
@@ -68,6 +91,406 @@ async def safe_send_to_control_plane(control_plane_client: AsyncControlPlaneClie
     except Exception as e:
         print(f"[ERROR] Unexpected error sending to control plane: {e}")
         raise
+
+# =====================================================
+# SUPABASE LOGGING FUNCTIONS
+# =====================================================
+"""
+EVENT LOGGING SYSTEM
+
+This system logs all Hume EVI interactions and NexHealth API calls to Supabase
+for analytics, debugging, and compliance purposes.
+
+WHAT GETS LOGGED:
+1. Call Sessions (call_sessions table):
+   - chat_started events: When a call begins
+   - chat_ended events: When a call ends
+   - Includes: chat_id, caller_number, timestamps, full payloads
+   
+2. Tool Calls (tool_call_events table):
+   - Every tool invocation from Hume AI
+   - Parameters, execution time, success/failure
+   - Response content sent back to Hume
+   - Linked to call_sessions via chat_id
+   
+3. NexHealth API Calls (nexhealth_api_logs table):
+   - Every HTTP request to NexHealth Synchronizer API
+   - Request/response details, timing, status codes
+   - Linked to tool_call_events via tool_call_id
+   - Sensitive headers (Authorization) are redacted
+
+HOW IT WORKS:
+- log_and_execute_tool() wraps all tool handlers
+- Context variables (_current_chat_id, _current_tool_call_id) track the current execution context
+- logged_httpx_request() can wrap httpx calls to automatically log API calls
+- All logging failures are caught and logged but don't crash the webhook
+
+USAGE:
+1. Wrap tool handlers with log_and_execute_tool() (already done in webhook router)
+2. Use logged_httpx_request() instead of httpx.AsyncClient() for automatic API logging
+3. Or manually call log_nexhealth_api_call() for specific API calls
+
+PRIVACY & SECURITY:
+- Authorization headers are redacted in logs
+- Patient data is logged for debugging but should be protected by Supabase RLS
+- Consider implementing data retention policies
+"""
+
+async def log_call_session_start(chat_id: str, chat_group_id: str, config_id: str, caller_number: str, full_payload: dict):
+    """
+    Log the start of a call session to Supabase.
+    
+    Args:
+        chat_id: Unique chat ID from Hume
+        chat_group_id: Chat group ID
+        config_id: EVI config ID
+        caller_number: Phone number of caller
+        full_payload: Complete webhook payload
+    """
+    if not supabase_client:
+        return
+    
+    try:
+        data = {
+            "chat_id": chat_id,
+            "chat_group_id": chat_group_id,
+            "config_id": config_id,
+            "caller_number": caller_number,
+            "started_at": datetime.utcnow().isoformat(),
+            "status": "active",
+            "chat_started_payload": full_payload
+        }
+        
+        result = supabase_client.table("call_sessions").insert(data).execute()
+        print(f"[SUPABASE] Logged call session start: {chat_id}")
+        return result
+    except Exception as e:
+        print(f"[SUPABASE ERROR] Failed to log call session start: {e}")
+        return None
+
+async def log_call_session_end(chat_id: str, full_payload: dict):
+    """
+    Log the end of a call session to Supabase.
+    
+    Args:
+        chat_id: Unique chat ID from Hume
+        full_payload: Complete webhook payload
+    """
+    if not supabase_client:
+        return
+    
+    try:
+        data = {
+            "ended_at": datetime.utcnow().isoformat(),
+            "status": "completed",
+            "chat_ended_payload": full_payload
+        }
+        
+        result = supabase_client.table("call_sessions").update(data).eq("chat_id", chat_id).execute()
+        print(f"[SUPABASE] Logged call session end: {chat_id}")
+        return result
+    except Exception as e:
+        print(f"[SUPABASE ERROR] Failed to log call session end: {e}")
+        return None
+
+async def log_tool_call_event(
+    chat_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    tool_type: str,
+    parameters: dict,
+    response_required: bool,
+    webhook_payload: dict,
+    sequence_number: int = None
+):
+    """
+    Log a tool call event to Supabase.
+    
+    Args:
+        chat_id: Chat ID
+        tool_call_id: Unique tool call ID
+        tool_name: Name of the tool
+        tool_type: Type of tool (function, etc.)
+        parameters: Tool parameters
+        response_required: Whether response is required
+        webhook_payload: Complete webhook payload
+        sequence_number: Sequence number of this tool call
+    
+    Returns:
+        The created record ID
+    """
+    if not supabase_client:
+        return None
+    
+    try:
+        data = {
+            "chat_id": chat_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "tool_type": tool_type,
+            "parameters": parameters,
+            "response_required": response_required,
+            "called_at": datetime.utcnow().isoformat(),
+            "execution_started_at": datetime.utcnow().isoformat(),
+            "webhook_payload": webhook_payload,
+            "sequence_number": sequence_number
+        }
+        
+        result = supabase_client.table("tool_call_events").insert(data).execute()
+        
+        if result.data and len(result.data) > 0:
+            record_id = result.data[0].get("id")
+            print(f"[SUPABASE] Logged tool call event: {tool_name} (ID: {record_id})")
+            return record_id
+        return None
+    except Exception as e:
+        print(f"[SUPABASE ERROR] Failed to log tool call event: {e}")
+        return None
+
+async def log_tool_call_result(
+    tool_call_id: str,
+    success: bool,
+    result_summary: str = None,
+    result_data: dict = None,
+    error_type: str = None,
+    error_message: str = None,
+    error_detail: dict = None,
+    response_type: str = None,
+    response_content: str = None,
+    execution_time_ms: int = None
+):
+    """
+    Update a tool call event with execution results.
+    
+    Args:
+        tool_call_id: Unique tool call ID
+        success: Whether the tool execution succeeded
+        result_summary: Brief summary of result
+        result_data: Complete result data
+        error_type: Type of error if failed
+        error_message: Error message if failed
+        error_detail: Detailed error info
+        response_type: Type of response sent to Hume
+        response_content: Content sent to Hume
+        execution_time_ms: Execution time in milliseconds
+    """
+    if not supabase_client:
+        return
+    
+    try:
+        data = {
+            "execution_completed_at": datetime.utcnow().isoformat(),
+            "success": success,
+            "execution_time_ms": execution_time_ms
+        }
+        
+        if result_summary:
+            data["result_summary"] = result_summary
+        if result_data:
+            data["result_data"] = result_data
+        if error_type:
+            data["error_type"] = error_type
+        if error_message:
+            data["error_message"] = error_message
+        if error_detail:
+            data["error_detail"] = error_detail
+        if response_type:
+            data["response_type"] = response_type
+        if response_content:
+            data["response_content"] = response_content
+        if response_content:
+            data["response_sent_at"] = datetime.utcnow().isoformat()
+        
+        result = supabase_client.table("tool_call_events").update(data).eq("tool_call_id", tool_call_id).execute()
+        print(f"[SUPABASE] Updated tool call result: {tool_call_id} (success={success})")
+        return result
+    except Exception as e:
+        print(f"[SUPABASE ERROR] Failed to log tool call result: {e}")
+        return None
+
+async def log_nexhealth_api_call(
+    chat_id: str,
+    tool_call_id: str,
+    endpoint: str,
+    http_method: str,
+    request_url: str = None,
+    request_headers: dict = None,
+    request_params: dict = None,
+    request_body: dict = None,
+    response_status: int = None,
+    response_headers: dict = None,
+    response_body: dict = None,
+    response_time_ms: int = None,
+    success: bool = None,
+    error_message: str = None,
+    error_type: str = None
+):
+    """
+    Log a NexHealth API call to Supabase.
+    
+    Args:
+        chat_id: Chat ID
+        tool_call_id: Associated tool call ID
+        endpoint: API endpoint path
+        http_method: HTTP method (GET, POST, etc.)
+        request_url: Full request URL
+        request_headers: Request headers (sensitive data removed)
+        request_params: Query parameters
+        request_body: Request body
+        response_status: HTTP response status code
+        response_headers: Response headers
+        response_body: Response body
+        response_time_ms: Response time in milliseconds
+        success: Whether the call succeeded
+        error_message: Error message if failed
+        error_type: Type of error
+    """
+    if not supabase_client:
+        return
+    
+    try:
+        # Remove sensitive data from headers
+        safe_request_headers = {}
+        if request_headers:
+            safe_request_headers = {k: v for k, v in request_headers.items() if k.lower() not in ['authorization', 'api-key']}
+            if 'Authorization' in request_headers or 'authorization' in request_headers:
+                safe_request_headers['Authorization'] = 'Bearer ***'
+        
+        safe_response_headers = {}
+        if response_headers:
+            safe_response_headers = {k: v for k, v in response_headers.items() if k.lower() not in ['authorization', 'api-key']}
+        
+        data = {
+            "chat_id": chat_id,
+            "tool_call_id": tool_call_id,
+            "endpoint": endpoint,
+            "http_method": http_method,
+            "request_url": request_url,
+            "request_headers": safe_request_headers,
+            "request_params": request_params,
+            "request_body": request_body,
+            "response_status": response_status,
+            "response_headers": safe_response_headers,
+            "response_body": response_body,
+            "response_time_ms": response_time_ms,
+            "called_at": datetime.utcnow().isoformat(),
+            "success": success,
+            "error_message": error_message,
+            "error_type": error_type
+        }
+        
+        result = supabase_client.table("nexhealth_api_logs").insert(data).execute()
+        print(f"[SUPABASE] Logged NexHealth API call: {http_method} {endpoint} (status={response_status})")
+        return result
+    except Exception as e:
+        print(f"[SUPABASE ERROR] Failed to log NexHealth API call: {e}")
+        return None
+
+async def logged_httpx_request(method: str, url: str, **kwargs):
+    """
+    Wrapper for httpx requests that automatically logs to Supabase.
+    
+    Args:
+        method: HTTP method (GET, POST, PATCH, etc.)
+        url: Request URL
+        **kwargs: Additional arguments for httpx (params, json, headers, timeout, etc.)
+    
+    Returns:
+        httpx.Response object
+    """
+    start_time = time.time()
+    chat_id = _current_chat_id.get()
+    tool_call_id = _current_tool_call_id.get()
+    
+    # Extract endpoint from URL
+    endpoint = url.replace(SYNCRONIZER_BASE_URL, '') if SYNCRONIZER_BASE_URL in url else url
+    
+    # Extract request details
+    request_params = kwargs.get('params', {})
+    request_body = kwargs.get('json', kwargs.get('data'))
+    request_headers = kwargs.get('headers', {})
+    
+    response = None
+    error_msg = None
+    error_type_val = None
+    
+    try:
+        # Make the actual HTTP request
+        async with httpx.AsyncClient() as client:
+            if method.upper() == 'GET':
+                response = await client.get(url, **kwargs)
+            elif method.upper() == 'POST':
+                response = await client.post(url, **kwargs)
+            elif method.upper() == 'PATCH':
+                response = await client.patch(url, **kwargs)
+            elif method.upper() == 'PUT':
+                response = await client.put(url, **kwargs)
+            elif method.upper() == 'DELETE':
+                response = await client.delete(url, **kwargs)
+            else:
+                response = await client.request(method, url, **kwargs)
+        
+        response_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Parse response body
+        try:
+            response_body = response.json()
+        except:
+            response_body = {"raw": response.text}
+        
+        # Log to Supabase
+        if chat_id and tool_call_id:
+            await log_nexhealth_api_call(
+                chat_id=chat_id,
+                tool_call_id=tool_call_id,
+                endpoint=endpoint,
+                http_method=method.upper(),
+                request_url=url,
+                request_headers=request_headers,
+                request_params=request_params,
+                request_body=request_body if isinstance(request_body, dict) else None,
+                response_status=response.status_code,
+                response_headers=dict(response.headers),
+                response_body=response_body,
+                response_time_ms=response_time_ms,
+                success=200 <= response.status_code < 300,
+                error_message=None,
+                error_type=None
+            )
+        
+        return response
+        
+    except Exception as e:
+        response_time_ms = int((time.time() - start_time) * 1000)
+        error_msg = str(e)
+        error_type_val = type(e).__name__
+        
+        # Log error to Supabase
+        if chat_id and tool_call_id:
+            await log_nexhealth_api_call(
+                chat_id=chat_id,
+                tool_call_id=tool_call_id,
+                endpoint=endpoint,
+                http_method=method.upper(),
+                request_url=url,
+                request_headers=request_headers,
+                request_params=request_params,
+                request_body=request_body if isinstance(request_body, dict) else None,
+                response_status=response.status_code if response else None,
+                response_headers=dict(response.headers) if response else None,
+                response_body=None,
+                response_time_ms=response_time_ms,
+                success=False,
+                error_message=error_msg,
+                error_type=error_type_val
+            )
+        
+        # Re-raise the exception
+        raise
+
+# =====================================================
+# END SUPABASE LOGGING FUNCTIONS
+# =====================================================
 
 # Dad joke generator
 def get_dad_joke():
@@ -1563,6 +1986,84 @@ async def get_available_slots(start_date, days, provider_ids=None, location_ids=
             "slots": []
         }
 
+async def log_and_execute_tool(
+    chat_id: str,
+    tool_call_message: ToolCallMessage,
+    handler_func,
+    control_plane_client: AsyncControlPlaneClient
+):
+    """
+    Wrapper to log tool calls and their results to Supabase.
+    
+    Args:
+        chat_id: Chat ID
+        tool_call_message: Tool call message from Hume
+        handler_func: The actual handler function to execute
+        control_plane_client: Control plane client
+    """
+    start_time = time.time()
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    # Set context variables for API logging
+    _current_chat_id.set(chat_id)
+    _current_tool_call_id.set(tool_call_id)
+    
+    # Parse parameters
+    parameters_str = tool_call_message.parameters or "{}"
+    if isinstance(parameters_str, str):
+        try:
+            parameters = json.loads(parameters_str)
+        except:
+            parameters = {"raw": parameters_str}
+    else:
+        parameters = parameters_str or {}
+    
+    # Log tool call start
+    await log_tool_call_event(
+        chat_id=chat_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        tool_type=getattr(tool_call_message, 'tool_type', 'function'),
+        parameters=parameters,
+        response_required=getattr(tool_call_message, 'response_required', True),
+        webhook_payload=tool_call_message.dict() if hasattr(tool_call_message, 'dict') else {}
+    )
+    
+    # Execute the handler
+    try:
+        result = await handler_func(control_plane_client, chat_id, tool_call_message)
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Log success
+        await log_tool_call_result(
+            tool_call_id=tool_call_id,
+            success=True,
+            result_summary=f"{tool_name} executed successfully",
+            execution_time_ms=execution_time_ms,
+            response_type="tool_response"
+        )
+        
+        return result
+    except Exception as e:
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Log error
+        await log_tool_call_result(
+            tool_call_id=tool_call_id,
+            success=False,
+            error_type=type(e).__name__,
+            error_message=str(e),
+            execution_time_ms=execution_time_ms,
+            response_type="tool_error"
+        )
+        
+        raise
+    finally:
+        # Clear context variables
+        _current_chat_id.set(None)
+        _current_tool_call_id.set(None)
+
 async def handle_search_patients_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
     """
     Handle the search_patients tool call and send the response back to the chat.
@@ -2662,9 +3163,24 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
         print(f"[CHAT] Chat started: {event.chat_id}")
         print(f"[CHAT] Event data: {event.dict()}")
         
+        # Log to Supabase
+        await log_call_session_start(
+            chat_id=event.chat_id,
+            chat_group_id=getattr(event, 'chat_group_id', None),
+            config_id=getattr(event, 'config_id', None),
+            caller_number=getattr(event, 'caller_number', None),
+            full_payload=event.dict()
+        )
+        
     elif isinstance(event, WebhookEventChatEnded):
         print(f"[CHAT] Chat ended: {event.chat_id}")
         print(f"[CHAT] Event data: {event.dict()}")
+        
+        # Log to Supabase
+        await log_call_session_end(
+            chat_id=event.chat_id,
+            full_payload=event.dict()
+        )
         
     elif isinstance(event, WebhookEventToolCall):
         print(f"[TOOL] Tool call received: {event.dict()}")
@@ -2672,26 +3188,50 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
         # Route to appropriate tool handler based on tool name
         tool_name = event.tool_call_message.name
         
-        if tool_name == "tell_dad_joke":
-            await handle_dad_joke_tool(control_plane_client, event.chat_id, event.tool_call_message)
-        elif tool_name == "search_patients":
-            await handle_search_patients_tool(control_plane_client, event.chat_id, event.tool_call_message)
-        elif tool_name == "create_patient":
-            await handle_create_patient_tool(control_plane_client, event.chat_id, event.tool_call_message)
-        elif tool_name == "get_providers":
-            await handle_get_providers_tool(control_plane_client, event.chat_id, event.tool_call_message)
-        elif tool_name == "get_available_slots":
-            await handle_get_available_slots_tool(control_plane_client, event.chat_id, event.tool_call_message)
-        elif tool_name == "get_locations":
-            await handle_get_locations_tool(control_plane_client, event.chat_id, event.tool_call_message)
-        elif tool_name == "book_appointment":
-            await handle_book_appointment_tool(control_plane_client, event.chat_id, event.tool_call_message)
-        elif tool_name == "get_patient_appointments":
-            await handle_get_patient_appointments_tool(control_plane_client, event.chat_id, event.tool_call_message)
-        elif tool_name == "reschedule_appointment":
-            await handle_reschedule_appointment_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        # Map tool names to handler functions
+        tool_handlers = {
+            "tell_dad_joke": handle_dad_joke_tool,
+            "search_patients": handle_search_patients_tool,
+            "create_patient": handle_create_patient_tool,
+            "get_providers": handle_get_providers_tool,
+            "get_available_slots": handle_get_available_slots_tool,
+            "get_locations": handle_get_locations_tool,
+            "book_appointment": handle_book_appointment_tool,
+            "get_patient_appointments": handle_get_patient_appointments_tool,
+            "reschedule_appointment": handle_reschedule_appointment_tool
+        }
+        
+        if tool_name in tool_handlers:
+            # Execute with logging
+            await log_and_execute_tool(
+                chat_id=event.chat_id,
+                tool_call_message=event.tool_call_message,
+                handler_func=tool_handlers[tool_name],
+                control_plane_client=control_plane_client
+            )
         else:
             print(f"[ERROR] Unknown tool: {tool_name}")
+            
+            # Log unknown tool call
+            await log_tool_call_event(
+                chat_id=event.chat_id,
+                tool_call_id=event.tool_call_message.tool_call_id,
+                tool_name=tool_name,
+                tool_type=getattr(event.tool_call_message, 'tool_type', 'function'),
+                parameters={},
+                response_required=True,
+                webhook_payload=event.dict()
+            )
+            
+            await log_tool_call_result(
+                tool_call_id=event.tool_call_message.tool_call_id,
+                success=False,
+                error_type="UnknownTool",
+                error_message=f"Unknown tool: {tool_name}",
+                response_type="tool_error",
+                response_content=f"I don't know how to use the {tool_name} tool. Please contact support."
+            )
+            
             # Send error response for unknown tools
             await safe_send_to_control_plane(
                 control_plane_client,
