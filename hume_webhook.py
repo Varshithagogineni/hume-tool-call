@@ -257,6 +257,127 @@ async def search_patients(name=None, phone_number=None, email=None, date_of_birt
             "patients": []
         }
 
+async def get_patient_appointments(patient_id, start_date=None, end_date=None, cancelled=False):
+    """
+    Get appointments for a specific patient.
+    
+    Args:
+        patient_id: Patient ID (required)
+        start_date: Start date for search in YYYY-MM-DD format (optional, defaults to today)
+        end_date: End date for search in YYYY-MM-DD format (optional, defaults to 90 days from start)
+        cancelled: Include cancelled appointments (default: False)
+    
+    Returns:
+        List of appointments or error message
+    """
+    try:
+        # Get valid bearer token
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            return {
+                "success": False,
+                "message": "Authentication failed. Unable to access appointments.",
+                "appointments": []
+            }
+        
+        # Set default date range if not provided
+        from datetime import datetime, timedelta
+        if not start_date:
+            start_date = datetime.now().strftime("%Y-%m-%d")
+        if not end_date:
+            # Default to 90 days from start
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = start_dt + timedelta(days=90)
+            end_date = end_dt.strftime("%Y-%m-%d")
+        
+        # Convert to ISO format with timezone
+        start_iso = f"{start_date}T00:00:00+00:00"
+        end_iso = f"{end_date}T23:59:59+00:00"
+        
+        # Prepare query parameters
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN,
+            "location_id": SYNCRONIZER_LOCATION_ID,
+            "patient_id": patient_id,
+            "start": start_iso,
+            "end": end_iso,
+            "cancelled": str(cancelled).lower(),
+            "per_page": 50  # Get up to 50 appointments
+        }
+        
+        # Set up headers
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+            "Nex-Api-Version": "v20240412"
+        }
+        
+        print(f"[APPOINTMENTS] Fetching appointments for patient {patient_id} from {start_date} to {end_date}")
+        
+        # Make API request
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SYNCRONIZER_BASE_URL}/appointments",
+                params=params,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            print(f"[APPOINTMENTS] Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                appointments_data = data.get("data", [])
+                
+                print(f"[APPOINTMENTS] Found {len(appointments_data)} appointment(s)")
+                
+                # Format appointments for voice agent
+                formatted_appointments = []
+                for appt in appointments_data:
+                    formatted_appt = {
+                        "id": appt.get("id"),
+                        "patient_id": appt.get("patient_id"),
+                        "provider_id": appt.get("provider_id"),
+                        "provider_name": appt.get("provider_name", "Unknown Provider"),
+                        "start_time": appt.get("start_time"),
+                        "end_time": appt.get("end_time"),
+                        "timezone": appt.get("timezone", "America/New_York"),
+                        "confirmed": appt.get("confirmed", False),
+                        "cancelled": appt.get("cancelled", False),
+                        "note": appt.get("note", ""),
+                        "location_id": appt.get("location_id")
+                    }
+                    formatted_appointments.append(formatted_appt)
+                    print(f"[APPOINTMENTS] Appt {appt.get('id')}: {appt.get('start_time')} with {appt.get('provider_name')}")
+                
+                return {
+                    "success": True,
+                    "message": f"Found {len(formatted_appointments)} appointment(s)",
+                    "appointments": formatted_appointments
+                }
+            else:
+                error_detail = response.text
+                print(f"[APPOINTMENTS ERROR] {response.status_code}: {error_detail}")
+                return {
+                    "success": False,
+                    "message": f"Failed to get appointments. API error: {response.status_code}",
+                    "appointments": []
+                }
+                
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": "Request timed out while fetching appointments.",
+            "appointments": []
+        }
+    except Exception as e:
+        print(f"[APPOINTMENTS EXCEPTION] {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error fetching appointments: {str(e)}",
+            "appointments": []
+        }
+
 async def create_patient(first_name, last_name, date_of_birth, gender, email, phone_number, middle_name=None, address=None):
     """
     Create a new patient in the Syncronizer.io system.
@@ -2019,6 +2140,132 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
             )
         )
 
+async def handle_get_patient_appointments_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the get_patient_appointments tool call and send the response back to the chat.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "get_patient_appointments":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse tool parameters (they come as JSON string)
+        parameters_str = tool_call_message.parameters or "{}"
+        
+        # Parse JSON string to dictionary
+        if isinstance(parameters_str, str):
+            parameters = json.loads(parameters_str)
+        else:
+            parameters = parameters_str or {}
+        
+        # Extract parameters
+        patient_id = parameters.get("patient_id")
+        start_date = parameters.get("start_date")
+        end_date = parameters.get("end_date")
+        include_cancelled = parameters.get("include_cancelled", False)
+        
+        print(f"[APPOINTMENTS] Patient: {patient_id}, Start: {start_date}, End: {end_date}")
+        
+        # Validate required fields
+        if not patient_id:
+            error_msg = "I need a patient ID to check appointments. Please search for the patient first."
+            await safe_send_to_control_plane(
+                control_plane_client,
+                chat_id,
+                ToolResponseMessage(
+                    tool_call_id=tool_call_id,
+                    content=error_msg
+                )
+            )
+            return
+        
+        # Get appointments
+        result = await get_patient_appointments(
+            patient_id=patient_id,
+            start_date=start_date,
+            end_date=end_date,
+            cancelled=include_cancelled
+        )
+        
+        # Format response for voice agent
+        if result["success"]:
+            appointments = result["appointments"]
+            
+            if appointments:
+                # Parse and format appointment times
+                from datetime import datetime
+                
+                response_content = f"I found {len(appointments)} appointment(s):\n\n"
+                
+                for i, appt in enumerate(appointments, 1):
+                    try:
+                        # Parse ISO datetime (UTC) and convert to appointment's timezone
+                        from zoneinfo import ZoneInfo
+                        
+                        # Parse UTC time
+                        dt_utc = datetime.fromisoformat(appt['start_time'].replace('Z', '+00:00'))
+                        
+                        # Convert to appointment's timezone
+                        appt_timezone = appt.get('timezone', 'America/New_York')
+                        dt_local = dt_utc.astimezone(ZoneInfo(appt_timezone))
+                        
+                        # Format in local time
+                        formatted_time = dt_local.strftime("%A, %B %d at %I:%M %p %Z")
+                    except Exception as e:
+                        print(f"[APPOINTMENTS WARNING] Failed to parse time: {e}")
+                        formatted_time = appt['start_time']
+                    
+                    status = "Cancelled" if appt.get('cancelled') else ("Confirmed" if appt.get('confirmed') else "Pending")
+                    
+                    response_content += f"{i}. {formatted_time} with {appt['provider_name']} - Status: {status}"
+                    
+                    if appt.get('note'):
+                        response_content += f" (Note: {appt['note']})"
+                    
+                    response_content += "\n"
+                
+                response_content += "\nWould you like to reschedule any of these appointments, or book a new one?"
+            else:
+                response_content = "You don't have any upcoming appointments scheduled. Would you like to book one?"
+        else:
+            response_content = f"I had trouble checking your appointments: {result['message']}. Let me try to help you in another way."
+        
+        # Send the result as a tool response
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Appointment check completed successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle get patient appointments tool: {e}")
+        
+        # Send error response
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="AppointmentCheckError",
+                content=f"I'm having trouble checking appointments right now. Please try again or contact our office directly. Error: {str(e)}"
+            )
+        )
+
 async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
     """
     Handle the tell_dad_joke tool call and send the response back to the chat.
@@ -2114,6 +2361,8 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             await handle_get_locations_tool(control_plane_client, event.chat_id, event.tool_call_message)
         elif tool_name == "book_appointment":
             await handle_book_appointment_tool(control_plane_client, event.chat_id, event.tool_call_message)
+        elif tool_name == "get_patient_appointments":
+            await handle_get_patient_appointments_tool(control_plane_client, event.chat_id, event.tool_call_message)
         else:
             print(f"[ERROR] Unknown tool: {tool_name}")
             # Send error response for unknown tools
