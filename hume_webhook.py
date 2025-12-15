@@ -647,6 +647,99 @@ async def get_patient_by_id(patient_id):
         print(f"[GET PATIENT] Error: {e}")
         return None
 
+async def get_reminder_context(appointment_id: str):
+    """
+    Get reminder context for an outbound call.
+    Looks up appointment details from Supabase and patient details from NexHealth.
+    
+    Args:
+        appointment_id: The appointment ID (passed as custom_session_id from Hume)
+    
+    Returns:
+        dict with patient_name, appointment_time, provider_name, or error
+    """
+    print(f"[REMINDER CONTEXT] Looking up context for appointment: {appointment_id}")
+    
+    if not supabase_client:
+        print("[REMINDER CONTEXT] Supabase client not available")
+        return {
+            "success": False,
+            "error": "Database not available"
+        }
+    
+    try:
+        # 1. Look up the outbound_calls table for this appointment
+        response = supabase_client.table("outbound_calls") \
+            .select("*") \
+            .eq("appointment_id", appointment_id) \
+            .single() \
+            .execute()
+        
+        if not response.data:
+            print(f"[REMINDER CONTEXT] No outbound call record found for appointment {appointment_id}")
+            return {
+                "success": False,
+                "error": "Appointment not found in our records"
+            }
+        
+        call_record = response.data
+        patient_id = call_record.get("patient_id")
+        appointment_time_str = call_record.get("appointment_time")
+        timezone_str = call_record.get("timezone", "America/New_York")
+        
+        print(f"[REMINDER CONTEXT] Found record - Patient ID: {patient_id}, Time: {appointment_time_str}, TZ: {timezone_str}")
+        
+        # 2. Get patient details from NexHealth
+        patient = await get_patient_by_id(patient_id)
+        
+        if patient:
+            patient_name = f"{patient.get('first_name', '')} {patient.get('last_name', '')}".strip()
+        else:
+            patient_name = "Patient"
+            print(f"[REMINDER CONTEXT] Could not fetch patient details for ID {patient_id}")
+        
+        # 3. Format appointment time nicely
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        
+        try:
+            # Parse the UTC time from the database
+            dt_utc = datetime.fromisoformat(appointment_time_str.replace('Z', '+00:00'))
+            
+            # Convert to local timezone
+            local_tz = ZoneInfo(timezone_str)
+            dt_local = dt_utc.astimezone(local_tz)
+            
+            # Format nicely for speech
+            formatted_time = dt_local.strftime("%A, %B %d at %I:%M %p")
+            # Remove leading zero from hour (e.g., "09:00 AM" -> "9:00 AM")
+            formatted_time = formatted_time.replace(" 0", " ").replace(":00 ", " ")
+        except Exception as time_error:
+            print(f"[REMINDER CONTEXT] Error formatting time: {time_error}")
+            formatted_time = "your upcoming appointment"
+        
+        # 4. For now, we'll use a generic provider name
+        # TODO: Could look this up from NexHealth if appointment has provider_id
+        provider_name = "your dentist"
+        
+        print(f"[REMINDER CONTEXT] Returning - Patient: {patient_name}, Time: {formatted_time}")
+        
+        return {
+            "success": True,
+            "patient_name": patient_name,
+            "patient_first_name": patient.get('first_name', 'there') if patient else 'there',
+            "appointment_time": formatted_time,
+            "provider_name": provider_name,
+            "appointment_id": appointment_id
+        }
+        
+    except Exception as e:
+        print(f"[REMINDER CONTEXT] Error: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: str = None):
     """
     Make an outbound call using Twilio to connect the patient with Hume EVI.
@@ -674,9 +767,13 @@ def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: s
             formatted_number = '+1' + ''.join(filter(str.isdigit, formatted_number))
         
         # Build webhook URL with OUTBOUND config (different system prompt for reminders)
+        # Include custom_session_id so the AI can look up appointment details
         webhook_url = f"https://api.hume.ai/v0/evi/twilio?config_id={HUME_OUTBOUND_CONFIG_ID}&api_key={HUME_API_KEY}"
+        if appointment_id:
+            webhook_url += f"&custom_session_id={appointment_id}"
         
         print(f"[OUTBOUND CALL] Calling {formatted_number} from {TWILIO_PHONE_NUMBER}")
+        print(f"[OUTBOUND CALL] Custom session ID (appointment_id): {appointment_id}")
         
         # Make the call
         call = twilio_client.calls.create(
@@ -3358,6 +3455,88 @@ async def handle_reschedule_appointment_tool(control_plane_client: AsyncControlP
             )
         )
 
+async def handle_get_reminder_context_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage, custom_session_id: str = None):
+    """
+    Handle the get_reminder_context tool call for outbound reminder calls.
+    This tool fetches patient and appointment details so the AI knows who it's calling.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+        custom_session_id: The appointment ID passed from the webhook event (set when call was initiated)
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    print(f"[TOOL] Custom session ID from event: {custom_session_id}")
+    
+    if tool_name != "get_reminder_context":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # The appointment_id comes from custom_session_id (set when we initiated the call)
+        # No need for AI to pass it as a parameter!
+        appointment_id = custom_session_id
+        
+        print(f"[REMINDER CONTEXT] Looking up appointment: {appointment_id}")
+        
+        if not appointment_id:
+            # No custom_session_id means we don't know which appointment this is
+            fallback_msg = "I'm calling from Sabastian Demo Practice with a friendly reminder about your upcoming dental appointment. Can you confirm you'll be able to make it?"
+            await safe_send_to_control_plane(
+                control_plane_client,
+                chat_id,
+                ToolResponseMessage(
+                    tool_call_id=tool_call_id,
+                    content=f"NO_CONTEXT_AVAILABLE. Use this fallback greeting: {fallback_msg}"
+                )
+            )
+            return
+        
+        # Get the reminder context
+        result = await get_reminder_context(appointment_id)
+        
+        # Format response for voice agent
+        if result["success"]:
+            response_content = f"""REMINDER CALL CONTEXT:
+- Patient Name: {result['patient_name']}
+- Patient First Name: {result['patient_first_name']}
+- Appointment Time: {result['appointment_time']}
+- Provider: {result['provider_name']}
+
+Now greet the patient warmly using their first name and remind them about their appointment."""
+        else:
+            response_content = f"I couldn't retrieve the appointment details ({result.get('error', 'unknown error')}). Please greet the caller warmly and mention this is a reminder call from Sabastian Demo Practice about their upcoming dental appointment."
+        
+        # Send the result as a tool response
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Reminder context retrieved successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle get reminder context tool: {e}")
+        
+        # Send error response
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="ReminderContextError",
+                content="I'm having trouble retrieving the appointment details. Please greet the caller warmly and mention this is a reminder call from Sabastian Demo Practice."
+            )
+        )
+
 async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
     """
     Handle the tell_dad_joke tool call and send the response back to the chat.
@@ -3517,6 +3696,10 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
     elif isinstance(event, WebhookEventToolCall):
         print(f"[TOOL] Tool call received: {event.dict()}")
         
+        # Extract custom_session_id from the event (used for outbound call context)
+        custom_session_id = getattr(event, 'custom_session_id', None)
+        print(f"[TOOL] Custom session ID: {custom_session_id}")
+        
         # Route to appropriate tool handler based on tool name
         tool_name = event.tool_call_message.name
         
@@ -3533,7 +3716,15 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             "reschedule_appointment": handle_reschedule_appointment_tool
         }
         
-        if tool_name in tool_handlers:
+        # Special handling for get_reminder_context (needs custom_session_id)
+        if tool_name == "get_reminder_context":
+            await handle_get_reminder_context_tool(
+                control_plane_client,
+                event.chat_id,
+                event.tool_call_message,
+                custom_session_id  # Pass the appointment_id from the call setup
+            )
+        elif tool_name in tool_handlers:
             # Execute with logging
             await log_and_execute_tool(
                 chat_id=event.chat_id,
