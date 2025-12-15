@@ -4,3 +4,4 @@ hume==0.13.5
 starlette
 httpx
 supabase
+twilio

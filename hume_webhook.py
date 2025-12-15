@@ -56,6 +56,27 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("[SUPABASE WARNING] No credentials found - logging disabled")
 
+# Twilio configuration for outbound calls (set these in environment variables)
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+16822773630")
+
+# Hume EVI Config IDs (set these in environment variables)
+HUME_CONFIG_ID = os.getenv("HUME_CONFIG_ID", "1c4db189-fe77-438c-bfc9-82155d7c4fd4")  # Inbound calls
+HUME_OUTBOUND_CONFIG_ID = os.getenv("HUME_OUTBOUND_CONFIG_ID", "58145c07-e3d6-435f-9963-cee34bbe598b")  # Outbound reminder calls
+
+# Twilio client for outbound calls
+twilio_client = None
+try:
+    from twilio.rest import Client as TwilioClient
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        print("[TWILIO] Client initialized successfully")
+except ImportError:
+    print("[TWILIO WARNING] Twilio library not installed - outbound calls disabled")
+except Exception as e:
+    print(f"[TWILIO ERROR] Failed to initialize client: {e}")
+
 # Context variables for tracking current tool call (for API logging)
 _current_chat_id: ContextVar[str] = ContextVar('current_chat_id', default=None)
 _current_tool_call_id: ContextVar[str] = ContextVar('current_tool_call_id', default=None)
@@ -569,6 +590,211 @@ async def get_bearer_token():
     # Token is expired or doesn't exist, authenticate
     print("[AUTH] Bearer token expired or missing, authenticating...")
     return await authenticate_syncronizer()
+
+async def get_patient_by_id(patient_id):
+    """
+    Get patient details by ID from the Syncronizer.io API.
+    
+    Args:
+        patient_id: The patient ID
+    
+    Returns:
+        Patient data including phone number, or None if not found
+    """
+    try:
+        bearer_token = await get_bearer_token()
+        if not bearer_token:
+            print("[GET PATIENT] Authentication failed")
+            return None
+        
+        headers = {
+            "Accept": "application/vnd.Nexhealth+json;version=2",
+            "Authorization": f"Bearer {bearer_token}"
+        }
+        
+        params = {
+            "subdomain": SYNCRONIZER_SUBDOMAIN
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SYNCRONIZER_BASE_URL}/patients/{patient_id}",
+                params=params,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                patient = data.get("data", {})
+                
+                # Extract phone number from bio
+                bio = patient.get("bio", {})
+                phone = bio.get("cell_phone_number") or bio.get("phone_number") or bio.get("home_phone_number")
+                
+                return {
+                    "id": patient.get("id"),
+                    "first_name": patient.get("first_name"),
+                    "last_name": patient.get("last_name"),
+                    "phone_number": phone,
+                    "email": patient.get("email")
+                }
+            else:
+                print(f"[GET PATIENT] Failed to get patient {patient_id}: {response.status_code}")
+                return None
+                
+    except Exception as e:
+        print(f"[GET PATIENT] Error: {e}")
+        return None
+
+def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: str = None):
+    """
+    Make an outbound call using Twilio to connect the patient with Hume EVI.
+    
+    Args:
+        to_number: Phone number to call in E.164 format (e.g., +15163042196)
+        patient_id: Optional patient ID for context
+        appointment_id: Optional appointment ID for context
+    
+    Returns:
+        dict with call status and details, or error information
+    """
+    if not twilio_client:
+        print("[OUTBOUND CALL] Twilio client not initialized")
+        return {
+            "success": False,
+            "error": "Twilio client not initialized"
+        }
+    
+    try:
+        # Format phone number to E.164 if needed
+        formatted_number = to_number.strip()
+        if not formatted_number.startswith('+'):
+            # Assume US number if no country code
+            formatted_number = '+1' + ''.join(filter(str.isdigit, formatted_number))
+        
+        # Build webhook URL with OUTBOUND config (different system prompt for reminders)
+        webhook_url = f"https://api.hume.ai/v0/evi/twilio?config_id={HUME_OUTBOUND_CONFIG_ID}&api_key={HUME_API_KEY}"
+        
+        print(f"[OUTBOUND CALL] Calling {formatted_number} from {TWILIO_PHONE_NUMBER}")
+        
+        # Make the call
+        call = twilio_client.calls.create(
+            to=formatted_number,
+            from_=TWILIO_PHONE_NUMBER,
+            url=webhook_url
+        )
+        
+        print(f"[OUTBOUND CALL] Call initiated - SID: {call.sid}, Status: {call.status}")
+        
+        return {
+            "success": True,
+            "call_sid": call.sid,
+            "status": call.status,
+            "to": formatted_number,
+            "from": TWILIO_PHONE_NUMBER
+        }
+        
+    except Exception as e:
+        print(f"[OUTBOUND CALL ERROR] Failed to make call: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+async def process_pending_outbound_calls(hours_before: int = 24, calling_hours: tuple = (9, 19)):
+    """
+    Process pending outbound calls from the queue.
+    This function is designed to be called by a cron job.
+    
+    Args:
+        hours_before: Hours before appointment to make the call (default: 24)
+        calling_hours: Tuple of (start_hour, end_hour) in local time (default: 9 AM to 7 PM)
+    
+    Returns:
+        dict with processing results
+    """
+    if not supabase_client:
+        return {"success": False, "error": "Supabase client not initialized"}
+    
+    if not twilio_client:
+        return {"success": False, "error": "Twilio client not initialized"}
+    
+    try:
+        from zoneinfo import ZoneInfo
+        
+        # Get pending calls that are due (appointment within next X hours)
+        result = supabase_client.table("outbound_calls").select("*").eq(
+            "status", "pending"
+        ).execute()
+        
+        pending_calls = result.data or []
+        processed = 0
+        skipped = 0
+        failed = 0
+        
+        for call_record in pending_calls:
+            try:
+                # Parse appointment time
+                appt_time = datetime.fromisoformat(call_record['appointment_time'].replace('Z', '+00:00'))
+                timezone_str = call_record.get('timezone', 'America/New_York')
+                tz = ZoneInfo(timezone_str)
+                
+                # Convert to local time
+                now_local = datetime.now(tz)
+                appt_local = appt_time.astimezone(tz)
+                
+                # Check if appointment is within the reminder window
+                hours_until_appt = (appt_local - now_local).total_seconds() / 3600
+                if hours_until_appt > hours_before or hours_until_appt < 0:
+                    continue  # Not due yet or already passed
+                
+                # Check if current time is within calling hours
+                current_hour = now_local.hour
+                if current_hour < calling_hours[0] or current_hour >= calling_hours[1]:
+                    skipped += 1
+                    continue  # Outside calling hours
+                
+                # Make the call
+                call_result = make_outbound_call(
+                    to_number=call_record['phone_number'],
+                    patient_id=call_record['patient_id'],
+                    appointment_id=call_record['appointment_id']
+                )
+                
+                # Update the record
+                if call_result['success']:
+                    supabase_client.table("outbound_calls").update({
+                        "status": "completed",
+                        "call_attempts": call_record.get('call_attempts', 0) + 1,
+                        "last_attempt_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("appointment_id", call_record['appointment_id']).execute()
+                    processed += 1
+                else:
+                    supabase_client.table("outbound_calls").update({
+                        "status": "failed" if call_record.get('call_attempts', 0) >= 2 else "pending",
+                        "call_attempts": call_record.get('call_attempts', 0) + 1,
+                        "last_attempt_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("appointment_id", call_record['appointment_id']).execute()
+                    failed += 1
+                    
+            except Exception as call_err:
+                print(f"[OUTBOUND CALL ERROR] Failed to process call {call_record.get('appointment_id')}: {call_err}")
+                failed += 1
+        
+        return {
+            "success": True,
+            "processed": processed,
+            "skipped": skipped,
+            "failed": failed,
+            "total_pending": len(pending_calls)
+        }
+        
+    except Exception as e:
+        print(f"[OUTBOUND CALL ERROR] Failed to process pending calls: {e}")
+        return {"success": False, "error": str(e)}
 
 async def search_patients(name=None, phone_number=None, email=None, date_of_birth=None):
     """
@@ -2756,6 +2982,32 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
                 response_content += f" Note: {appointment['note']}"
             
             response_content += " You should receive a confirmation shortly. Is there anything else I can help you with?"
+            
+            # Add to outbound calls queue for reminder
+            try:
+                if supabase_client:
+                    # Get patient phone number
+                    patient_data = await get_patient_by_id(patient_id)
+                    if patient_data and patient_data.get("phone_number"):
+                        # Parse appointment time and timezone
+                        appt_time = appointment.get('start_time')
+                        appt_timezone = appointment.get('timezone', 'America/New_York')
+                        
+                        # Insert into outbound_calls table
+                        supabase_client.table("outbound_calls").insert({
+                            "patient_id": str(patient_id),
+                            "appointment_id": str(appointment.get('id')),
+                            "phone_number": patient_data["phone_number"],
+                            "appointment_time": appt_time,
+                            "timezone": appt_timezone,
+                            "status": "pending"
+                        }).execute()
+                        print(f"[OUTBOUND] Added reminder call for appointment {appointment.get('id')}")
+                    else:
+                        print(f"[OUTBOUND] No phone number found for patient {patient_id}, skipping reminder")
+            except Exception as outbound_err:
+                # Don't fail the booking if outbound call insert fails
+                print(f"[OUTBOUND ERROR] Failed to add reminder call: {outbound_err}")
         else:
             # Check if the error is related to invalid patient ID
             error_detail = result.get('error_detail', '')
@@ -3022,6 +3274,17 @@ async def handle_reschedule_appointment_tool(control_plane_client: AsyncControlP
                 if appointment.get('provider_name'):
                     response_content += f" Your appointment with {appointment['provider_name']} has been cancelled."
                 response_content += " Is there anything else I can help you with?"
+                
+                # Update outbound_calls to cancelled
+                try:
+                    if supabase_client:
+                        supabase_client.table("outbound_calls").update({
+                            "status": "cancelled",
+                            "updated_at": "now()"
+                        }).eq("appointment_id", str(appointment_id)).execute()
+                        print(f"[OUTBOUND] Cancelled reminder call for appointment {appointment_id}")
+                except Exception as outbound_err:
+                    print(f"[OUTBOUND ERROR] Failed to cancel reminder: {outbound_err}")
             else:
                 # Parse and format the start time for voice
                 from datetime import datetime
@@ -3043,6 +3306,18 @@ async def handle_reschedule_appointment_tool(control_plane_client: AsyncControlP
                     response_content += f" Note: {appointment['note']}"
                 
                 response_content += " You should receive a confirmation shortly. Is there anything else I can help you with?"
+                
+                # Update outbound_calls with new appointment time
+                try:
+                    if supabase_client:
+                        supabase_client.table("outbound_calls").update({
+                            "appointment_time": appointment.get('start_time'),
+                            "status": "pending",  # Reset to pending for new reminder
+                            "updated_at": "now()"
+                        }).eq("appointment_id", str(appointment_id)).execute()
+                        print(f"[OUTBOUND] Updated reminder call for appointment {appointment_id}")
+                except Exception as outbound_err:
+                    print(f"[OUTBOUND ERROR] Failed to update reminder: {outbound_err}")
         else:
             # Handle different error scenarios
             error_detail = result.get('error_detail', '')
@@ -3149,6 +3424,59 @@ async def health():
         "service": "Hume EVI Dental Assistant Webhook",
         "timestamp": time.time()
     })
+
+@app.post("/trigger-outbound-calls")
+async def trigger_outbound_calls(request: Request):
+    """
+    Trigger processing of pending outbound calls.
+    This endpoint is designed to be called by a cron job.
+    
+    Optional query params:
+    - hours_before: Hours before appointment to make the call (default: 24)
+    - start_hour: Start of calling hours in local time (default: 9)
+    - end_hour: End of calling hours in local time (default: 19)
+    - api_key: Optional API key for authentication
+    """
+    # Optional: Add simple API key authentication
+    params = request.query_params
+    api_key = params.get("api_key")
+    
+    # You can add authentication here if needed
+    # if api_key != os.getenv("CRON_API_KEY"):
+    #     raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    hours_before = int(params.get("hours_before", 24))
+    start_hour = int(params.get("start_hour", 9))
+    end_hour = int(params.get("end_hour", 19))
+    
+    print(f"[CRON] Triggering outbound calls - hours_before={hours_before}, calling_hours=({start_hour}, {end_hour})")
+    
+    result = await process_pending_outbound_calls(
+        hours_before=hours_before,
+        calling_hours=(start_hour, end_hour)
+    )
+    
+    return JSONResponse(result)
+
+@app.post("/test-outbound-call")
+async def test_outbound_call(request: Request):
+    """
+    Test endpoint to make a single outbound call.
+    
+    Query params:
+    - to: Phone number to call (required)
+    """
+    params = request.query_params
+    to_number = params.get("to")
+    
+    if not to_number:
+        raise HTTPException(status_code=400, detail="Missing 'to' parameter - phone number required")
+    
+    print(f"[TEST CALL] Making test call to {to_number}")
+    
+    result = make_outbound_call(to_number=to_number)
+    
+    return JSONResponse(result)
 
 @app.post("/hume-webhook")
 async def hume_webhook_handler(request: Request, event: WebhookEvent):
