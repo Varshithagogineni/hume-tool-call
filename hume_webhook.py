@@ -647,7 +647,9 @@ async def get_patient_by_id(patient_id):
         print(f"[GET PATIENT] Error: {e}")
         return None
 
-def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: str = None):
+def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: str = None, 
+                       patient_name: str = None, provider_name: str = None, 
+                       appointment_time: str = None, appointment_time_formatted: str = None):
     """
     Make an outbound call using Twilio to connect the patient with Hume EVI.
     
@@ -655,6 +657,10 @@ def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: s
         to_number: Phone number to call in E.164 format (e.g., +15163042196)
         patient_id: Optional patient ID for context
         appointment_id: Optional appointment ID for context
+        patient_name: Patient's name for personalized greeting
+        provider_name: Doctor's name
+        appointment_time: Raw appointment time
+        appointment_time_formatted: Human-readable appointment time
     
     Returns:
         dict with call status and details, or error information
@@ -667,16 +673,37 @@ def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: s
         }
     
     try:
+        from urllib.parse import urlencode, quote
+        
         # Format phone number to E.164 if needed
         formatted_number = to_number.strip()
         if not formatted_number.startswith('+'):
             # Assume US number if no country code
             formatted_number = '+1' + ''.join(filter(str.isdigit, formatted_number))
         
-        # Build webhook URL with OUTBOUND config (different system prompt for reminders)
-        webhook_url = f"https://api.hume.ai/v0/evi/twilio?config_id={HUME_OUTBOUND_CONFIG_ID}&api_key={HUME_API_KEY}"
+        # Build webhook URL with OUTBOUND config and context in query params
+        # Hume EVI can access these via session variables
+        base_url = f"https://api.hume.ai/v0/evi/twilio"
+        
+        query_params = {
+            "config_id": HUME_OUTBOUND_CONFIG_ID,
+            "api_key": HUME_API_KEY
+        }
+        
+        # Add context parameters for personalization (URL encoded)
+        if patient_name:
+            query_params["patient_name"] = patient_name
+        if provider_name:
+            query_params["provider_name"] = provider_name
+        if appointment_time_formatted:
+            query_params["appointment_time"] = appointment_time_formatted
+        if appointment_id:
+            query_params["appointment_id"] = appointment_id
+            
+        webhook_url = f"{base_url}?{urlencode(query_params)}"
         
         print(f"[OUTBOUND CALL] Calling {formatted_number} from {TWILIO_PHONE_NUMBER}")
+        print(f"[OUTBOUND CALL] Context: patient={patient_name}, provider={provider_name}, time={appointment_time_formatted}")
         
         # Make the call
         call = twilio_client.calls.create(
@@ -755,11 +782,41 @@ async def process_pending_outbound_calls(hours_before: int = 24, calling_hours: 
                     skipped += 1
                     continue  # Outside calling hours
                 
-                # Make the call
+                # Fetch patient details for personalization
+                patient_name = "there"  # Default fallback
+                provider_name = "your dentist"  # Default fallback
+                appointment_time_formatted = appt_local.strftime("%A, %B %d at %I:%M %p")
+                
+                try:
+                    # Get patient info from NexHealth
+                    patient_data = await search_patients(phone_number=call_record['phone_number'])
+                    if patient_data and len(patient_data) > 0:
+                        first_name = patient_data[0].get('first_name', '')
+                        last_name = patient_data[0].get('last_name', '')
+                        patient_name = first_name if first_name else "there"
+                        print(f"[OUTBOUND CALL] Found patient: {first_name} {last_name}")
+                    
+                    # Get appointment info from NexHealth
+                    appointments = await get_patient_appointments(call_record['patient_id'])
+                    if appointments:
+                        # Find the matching appointment
+                        for appt in appointments:
+                            if str(appt.get('id')) == str(call_record['appointment_id']):
+                                provider_name = appt.get('provider_name', 'your dentist')
+                                print(f"[OUTBOUND CALL] Found appointment with provider: {provider_name}")
+                                break
+                except Exception as fetch_err:
+                    print(f"[OUTBOUND CALL] Warning: Could not fetch personalization data: {fetch_err}")
+                
+                # Make the call with personalization
                 call_result = make_outbound_call(
                     to_number=call_record['phone_number'],
                     patient_id=call_record['patient_id'],
-                    appointment_id=call_record['appointment_id']
+                    appointment_id=call_record['appointment_id'],
+                    patient_name=patient_name,
+                    provider_name=provider_name,
+                    appointment_time=call_record['appointment_time'],
+                    appointment_time_formatted=appointment_time_formatted
                 )
                 
                 # Update the record
@@ -3407,6 +3464,86 @@ async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, ch
             )
         )
 
+async def handle_get_outbound_call_context_tool(
+    control_plane_client,
+    chat_id: str,
+    tool_call_message
+):
+    """
+    Handle the get_outbound_call_context tool call.
+    Returns context about the current outbound call (patient name, provider, appointment time).
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    try:
+        if not supabase_client:
+            raise Exception("Database not available")
+        
+        # Get the most recent outbound context (within last 5 minutes)
+        result = supabase_client.table("current_outbound_context").select("*").order(
+            "created_at", desc=True
+        ).limit(1).execute()
+        
+        if result.data and len(result.data) > 0:
+            context = result.data[0]
+            response_content = json.dumps({
+                "success": True,
+                "patient_name": context.get("patient_name", "there"),
+                "provider_name": context.get("provider_name", "your dentist"),
+                "appointment_time_formatted": context.get("appointment_time_formatted", "your scheduled time"),
+                "phone_number": context.get("phone_number")
+            })
+            print(f"[OUTBOUND CONTEXT] Found: {response_content}")
+        else:
+            # No context found - provide defaults
+            response_content = json.dumps({
+                "success": False,
+                "patient_name": "there",
+                "provider_name": "your dentist",
+                "appointment_time_formatted": "your scheduled time",
+                "message": "No outbound call context found"
+            })
+            print(f"[OUTBOUND CONTEXT] No context found, using defaults")
+        
+        # Send the response
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Outbound context sent successfully!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get outbound context: {e}")
+        
+        # Send fallback response with defaults
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=json.dumps({
+                    "success": False,
+                    "patient_name": "there",
+                    "provider_name": "your dentist", 
+                    "appointment_time_formatted": "your scheduled time",
+                    "error": str(e)
+                })
+            )
+        )
+
 @app.get("/")
 async def root():
     """Root endpoint - confirms webhook is running."""
@@ -3530,7 +3667,8 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             "get_locations": handle_get_locations_tool,
             "book_appointment": handle_book_appointment_tool,
             "get_patient_appointments": handle_get_patient_appointments_tool,
-            "reschedule_appointment": handle_reschedule_appointment_tool
+            "reschedule_appointment": handle_reschedule_appointment_tool,
+            "get_outbound_call_context": handle_get_outbound_call_context_tool
         }
         
         if tool_name in tool_handlers:
