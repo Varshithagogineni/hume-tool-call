@@ -65,6 +65,9 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+16822773630")
 HUME_CONFIG_ID = os.getenv("HUME_CONFIG_ID", "1c4db189-fe77-438c-bfc9-82155d7c4fd4")  # Inbound calls
 HUME_OUTBOUND_CONFIG_ID = os.getenv("HUME_OUTBOUND_CONFIG_ID", "58145c07-e3d6-435f-9963-cee34bbe598b")  # Outbound reminder calls
 
+# Test mode - bypasses time checks for outbound calls (set to "true" to enable)
+OUTBOUND_TEST_MODE = os.getenv("OUTBOUND_TEST_MODE", "false").lower() == "true"
+
 # Twilio client for outbound calls
 twilio_client = None
 try:
@@ -843,14 +846,21 @@ async def process_pending_outbound_calls(hours_before: int = 24, calling_hours: 
                 
                 # Check if appointment is within the reminder window
                 hours_until_appt = (appt_local - now_local).total_seconds() / 3600
-                if hours_until_appt > hours_before or hours_until_appt < 0:
-                    continue  # Not due yet or already passed
                 
-                # Check if current time is within calling hours
-                current_hour = now_local.hour
-                if current_hour < calling_hours[0] or current_hour >= calling_hours[1]:
-                    skipped += 1
-                    continue  # Outside calling hours
+                # Test mode bypasses all time checks
+                if OUTBOUND_TEST_MODE:
+                    print(f"[CRON TEST MODE] Bypassing time checks for appointment {call_record['appointment_id']}")
+                else:
+                    if hours_until_appt > hours_before or hours_until_appt < 0:
+                        print(f"[CRON] Skipping appointment {call_record['appointment_id']} - hours_until_appt: {hours_until_appt}")
+                        continue  # Not due yet or already passed
+                    
+                    # Check if current time is within calling hours
+                    current_hour = now_local.hour
+                    if current_hour < calling_hours[0] or current_hour >= calling_hours[1]:
+                        skipped += 1
+                        print(f"[CRON] Skipping - outside calling hours ({current_hour} not in {calling_hours})")
+                        continue  # Outside calling hours
                 
                 # Make the call
                 call_result = make_outbound_call(
