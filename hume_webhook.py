@@ -789,18 +789,22 @@ async def process_pending_outbound_calls(hours_before: int = 24, calling_hours: 
                 
                 try:
                     # Get patient info from NexHealth
-                    patient_data = await search_patients(phone_number=call_record['phone_number'])
-                    if patient_data and len(patient_data) > 0:
-                        first_name = patient_data[0].get('first_name', '')
-                        last_name = patient_data[0].get('last_name', '')
-                        patient_name = first_name if first_name else "there"
-                        print(f"[OUTBOUND CALL] Found patient: {first_name} {last_name}")
+                    patient_result = await search_patients(phone_number=call_record['phone_number'])
+                    if patient_result.get('success') and patient_result.get('patients'):
+                        # Find the matching patient by ID
+                        for p in patient_result['patients']:
+                            if str(p.get('id')) == str(call_record['patient_id']):
+                                full_name = p.get('name', '')
+                                # Extract first name (first word of full name)
+                                patient_name = full_name.split()[0] if full_name else "there"
+                                print(f"[OUTBOUND CALL] Found patient: {full_name}, using first name: {patient_name}")
+                                break
                     
                     # Get appointment info from NexHealth
-                    appointments = await get_patient_appointments(call_record['patient_id'])
-                    if appointments:
+                    appt_result = await get_patient_appointments(call_record['patient_id'])
+                    if appt_result.get('success') and appt_result.get('appointments'):
                         # Find the matching appointment
-                        for appt in appointments:
+                        for appt in appt_result['appointments']:
                             if str(appt.get('id')) == str(call_record['appointment_id']):
                                 provider_name = appt.get('provider_name', 'your dentist')
                                 print(f"[OUTBOUND CALL] Found appointment with provider: {provider_name}")
