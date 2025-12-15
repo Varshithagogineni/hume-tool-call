@@ -704,6 +704,7 @@ def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: s
         
         print(f"[OUTBOUND CALL] Calling {formatted_number} from {TWILIO_PHONE_NUMBER}")
         print(f"[OUTBOUND CALL] Context: patient={patient_name}, provider={provider_name}, time={appointment_time_formatted}")
+        print(f"[OUTBOUND CALL] Webhook URL: {webhook_url}")
         
         # Make the call
         call = twilio_client.calls.create(
