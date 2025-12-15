@@ -2968,11 +2968,15 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
         if result["success"]:
             appointment = result["appointment"]
             
-            # Parse and format the start time for voice
+            # Parse and format the start time for voice (convert to local timezone)
             from datetime import datetime
+            from zoneinfo import ZoneInfo
             try:
-                dt = datetime.fromisoformat(appointment['start_time'].replace('Z', '+00:00'))
-                formatted_time = dt.strftime("%A, %B %d at %I:%M %p")
+                dt_utc = datetime.fromisoformat(appointment['start_time'].replace('Z', '+00:00'))
+                # Convert to appointment's local timezone
+                appt_timezone = appointment.get('timezone', 'America/New_York')
+                dt_local = dt_utc.astimezone(ZoneInfo(appt_timezone))
+                formatted_time = dt_local.strftime("%A, %B %d at %I:%M %p")
             except:
                 formatted_time = appointment['start_time']
             
