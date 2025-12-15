@@ -862,6 +862,15 @@ async def process_pending_outbound_calls(hours_before: int = 24, calling_hours: 
                         print(f"[CRON] Skipping - outside calling hours ({current_hour} not in {calling_hours})")
                         continue  # Outside calling hours
                 
+                # Set status to in_progress BEFORE making the call
+                # This allows get_reminder_context to look up this call
+                supabase_client.table("outbound_calls").update({
+                    "status": "in_progress",
+                    "last_attempt_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("appointment_id", call_record['appointment_id']).execute()
+                print(f"[CRON] Set status to in_progress for appointment {call_record['appointment_id']}")
+                
                 # Make the call
                 call_result = make_outbound_call(
                     to_number=call_record['phone_number'],
@@ -869,7 +878,7 @@ async def process_pending_outbound_calls(hours_before: int = 24, calling_hours: 
                     appointment_id=call_record['appointment_id']
                 )
                 
-                # Update the record
+                # Update the record based on result
                 if call_result['success']:
                     supabase_client.table("outbound_calls").update({
                         "status": "completed",
@@ -3474,7 +3483,7 @@ async def handle_get_reminder_context_tool(control_plane_client: AsyncControlPla
         control_plane_client: The control plane client instance
         chat_id: The ID of the chat
         tool_call_message: The tool call message
-        custom_session_id: The appointment ID passed from the webhook event (set when call was initiated)
+        custom_session_id: The appointment ID passed from the webhook event (may be None for Twilio calls)
     """
     tool_call_id = tool_call_message.tool_call_id
     tool_name = tool_call_message.name
@@ -3488,14 +3497,30 @@ async def handle_get_reminder_context_tool(control_plane_client: AsyncControlPla
         return
     
     try:
-        # The appointment_id comes from custom_session_id (set when we initiated the call)
-        # No need for AI to pass it as a parameter!
         appointment_id = custom_session_id
+        
+        # If no custom_session_id, try to find the most recent in_progress outbound call
+        # This handles Twilio calls where custom_session_id isn't passed via URL
+        if not appointment_id and supabase_client:
+            print("[REMINDER CONTEXT] No custom_session_id, looking up most recent in_progress call...")
+            try:
+                result = supabase_client.table("outbound_calls") \
+                    .select("appointment_id") \
+                    .eq("status", "in_progress") \
+                    .order("last_attempt_at", desc=True) \
+                    .limit(1) \
+                    .execute()
+                
+                if result.data and len(result.data) > 0:
+                    appointment_id = result.data[0]['appointment_id']
+                    print(f"[REMINDER CONTEXT] Found in_progress appointment: {appointment_id}")
+            except Exception as lookup_err:
+                print(f"[REMINDER CONTEXT] Error looking up in_progress call: {lookup_err}")
         
         print(f"[REMINDER CONTEXT] Looking up appointment: {appointment_id}")
         
         if not appointment_id:
-            # No custom_session_id means we don't know which appointment this is
+            # No way to identify the call - use fallback
             fallback_msg = "I'm calling from Sabastian Demo Practice with a friendly reminder about your upcoming dental appointment. Can you confirm you'll be able to make it?"
             await safe_send_to_control_plane(
                 control_plane_client,
