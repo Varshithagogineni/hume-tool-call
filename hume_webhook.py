@@ -530,7 +530,7 @@ def get_dad_joke():
     ]
     return random.choice(jokes)
 
-# Syncronizer.io API functions
+# Syncronizer.io API functions for tool calls
 async def authenticate_syncronizer():
     """
     Authenticate with Syncronizer.io API to get bearer token.
