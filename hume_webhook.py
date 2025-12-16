@@ -72,7 +72,9 @@ HUME_OUTBOUND_CONFIG_ID = os.getenv("HUME_OUTBOUND_CONFIG_ID", "58145c07-e3d6-43
 OUTBOUND_TEST_MODE = os.getenv("OUTBOUND_TEST_MODE", "false").lower() == "true"
 
 # Vercel URL for callbacks (Vercel provides this automatically, or set manually)
-VERCEL_URL = os.getenv("VERCEL_URL", os.getenv("WEBHOOK_URL", "https://hume-tool-call.vercel.app"))
+_raw_vercel_url = os.getenv("VERCEL_URL", os.getenv("WEBHOOK_URL", "https://hume-tool-call.vercel.app"))
+# Ensure URL has https:// prefix (Vercel sometimes provides URL without protocol)
+VERCEL_URL = _raw_vercel_url if _raw_vercel_url.startswith('http') else f"https://{_raw_vercel_url}"
 
 # Twilio client for outbound calls
 twilio_client = None
@@ -3613,8 +3615,13 @@ async def handle_forward_call_tool(control_plane_client: AsyncControlPlaneClient
         # If we have a call SID, redirect the call to our forward TwiML
         if call_sid:
             try:
+                # Ensure VERCEL_URL has https:// prefix (Vercel sometimes provides without protocol)
+                base_url = VERCEL_URL
+                if not base_url.startswith('http://') and not base_url.startswith('https://'):
+                    base_url = f"https://{base_url}"
+                
                 # Build the TwiML URL with the forward number
-                twiml_url = f"{VERCEL_URL}/forward-call-twiml?forward_to={forward_to}"
+                twiml_url = f"{base_url}/forward-call-twiml?forward_to={forward_to}"
                 
                 print(f"[FORWARD CALL] Redirecting call {call_sid} to {twiml_url}")
                 
