@@ -690,10 +690,11 @@ async def get_reminder_context(appointment_id: str):
         
         call_record = response.data
         patient_id = call_record.get("patient_id")
+        provider_id = call_record.get("provider_id")
         appointment_time_str = call_record.get("appointment_time")
         timezone_str = call_record.get("timezone", "America/New_York")
         
-        print(f"[REMINDER CONTEXT] Found record - Patient ID: {patient_id}, Time: {appointment_time_str}, TZ: {timezone_str}")
+        print(f"[REMINDER CONTEXT] Found record - Patient ID: {patient_id}, Provider ID: {provider_id}, Time: {appointment_time_str}, TZ: {timezone_str}")
         
         # 2. Get patient details from NexHealth
         patient = await get_patient_by_id(patient_id)
@@ -724,9 +725,19 @@ async def get_reminder_context(appointment_id: str):
             print(f"[REMINDER CONTEXT] Error formatting time: {time_error}")
             formatted_time = "your upcoming appointment"
         
-        # 4. For now, we'll use a generic provider name
-        # TODO: Could look this up from NexHealth if appointment has provider_id
-        provider_name = "your dentist"
+        # 4. Look up provider name from NexHealth
+        provider_name = "your dentist"  # Default fallback
+        if provider_id:
+            try:
+                providers_result = await get_providers(location_id=SYNCRONIZER_LOCATION_ID)
+                if providers_result["success"] and providers_result["providers"]:
+                    for provider in providers_result["providers"]:
+                        if str(provider.get("id")) == str(provider_id):
+                            provider_name = provider.get("name", "your dentist")
+                            print(f"[REMINDER CONTEXT] Found provider: {provider_name}")
+                            break
+            except Exception as provider_err:
+                print(f"[REMINDER CONTEXT] Error looking up provider: {provider_err}")
         
         print(f"[REMINDER CONTEXT] Returning - Patient: {patient_name}, Time: {formatted_time}")
         
@@ -3128,9 +3139,10 @@ async def handle_book_appointment_tool(control_plane_client: AsyncControlPlaneCl
                             "phone_number": patient_data["phone_number"],
                             "appointment_time": appt_time,
                             "timezone": appt_timezone,
+                            "provider_id": str(provider_id) if provider_id else None,
                             "status": "pending"
                         }).execute()
-                        print(f"[OUTBOUND] Added reminder call for appointment {appointment.get('id')}")
+                        print(f"[OUTBOUND] Added reminder call for appointment {appointment.get('id')} with provider {provider_id}")
                     else:
                         print(f"[OUTBOUND] No phone number found for patient {patient_id}, skipping reminder")
             except Exception as outbound_err:
