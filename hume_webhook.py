@@ -71,7 +71,13 @@ HUME_OUTBOUND_CONFIG_ID = os.getenv("HUME_OUTBOUND_CONFIG_ID", "58145c07-e3d6-43
 # Test mode - bypasses time checks for outbound calls (set to "true" to enable)
 OUTBOUND_TEST_MODE = os.getenv("OUTBOUND_TEST_MODE", "false").lower() == "true"
 
-# Vercel URL for callbacks (Vercel provides this automatically, or set manually)
+# Vercel URL for callbacks
+# IMPORTANT: Use a stable production URL for Twilio callbacks, NOT the preview deployment URL
+# The VERCEL_URL env var gives preview URLs like "hume-tool-call-abc123-account.vercel.app" which are temporary
+# For Twilio callbacks, we need the stable production URL
+TWILIO_CALLBACK_URL = os.getenv("TWILIO_CALLBACK_URL", "https://hume-tool-call.vercel.app")
+
+# General Vercel URL (may be preview URL during deployments)
 _raw_vercel_url = os.getenv("VERCEL_URL", os.getenv("WEBHOOK_URL", "https://hume-tool-call.vercel.app"))
 # Ensure URL has https:// prefix (Vercel sometimes provides URL without protocol)
 VERCEL_URL = _raw_vercel_url if _raw_vercel_url.startswith('http') else f"https://{_raw_vercel_url}"
@@ -3615,13 +3621,9 @@ async def handle_forward_call_tool(control_plane_client: AsyncControlPlaneClient
         # If we have a call SID, redirect the call to our forward TwiML
         if call_sid:
             try:
-                # Ensure VERCEL_URL has https:// prefix (Vercel sometimes provides without protocol)
-                base_url = VERCEL_URL
-                if not base_url.startswith('http://') and not base_url.startswith('https://'):
-                    base_url = f"https://{base_url}"
-                
+                # Use stable production URL for Twilio callbacks (not preview deployment URL)
                 # Build the TwiML URL with the forward number
-                twiml_url = f"{base_url}/forward-call-twiml?forward_to={forward_to}"
+                twiml_url = f"{TWILIO_CALLBACK_URL}/forward-call-twiml?forward_to={forward_to}"
                 
                 print(f"[FORWARD CALL] Redirecting call {call_sid} to {twiml_url}")
                 
@@ -3992,16 +3994,19 @@ async def forward_call_twiml(request: Request):
     This endpoint is called by Twilio when we redirect a call for forwarding.
     The TwiML instructs Twilio to dial the forward number.
     """
+    print(f"[FORWARD TWIML] *** Endpoint hit! Request from {request.client.host if request.client else 'unknown'} ***")
+    
     try:
         # Get optional parameters from query string
         params = request.query_params
         forward_to = params.get("forward_to", CALL_FORWARD_NUMBER)
         caller_id = params.get("caller_id", TWILIO_PHONE_NUMBER)
         
-        print(f"[FORWARD CALL] Generating TwiML to forward call to {forward_to}")
+        print(f"[FORWARD TWIML] Generating TwiML to forward call to {forward_to}")
+        print(f"[FORWARD TWIML] Caller ID: {caller_id}")
         
         if not TwiML_VoiceResponse:
-            print("[FORWARD CALL ERROR] TwiML library not available")
+            print("[FORWARD TWIML ERROR] TwiML library not available")
             return JSONResponse(
                 {"error": "TwiML library not available"}, 
                 status_code=500
@@ -4019,10 +4024,13 @@ async def forward_call_twiml(request: Request):
         # Dial the forward number
         # timeout: how long to wait for answer (30 seconds)
         # callerId: shows the original Twilio number to the recipient
+        status_callback_url = f"{TWILIO_CALLBACK_URL}/forward-call-status"
+        print(f"[FORWARD TWIML] Status callback URL: {status_callback_url}")
+        
         dial = response.dial(
             timeout=30,
             caller_id=caller_id,
-            action=f"{VERCEL_URL}/forward-call-status"  # Optional: track transfer result
+            action=status_callback_url
         )
         dial.number(forward_to)
         
@@ -4034,14 +4042,16 @@ async def forward_call_twiml(request: Request):
         response.hangup()
         
         twiml_str = str(response)
-        print(f"[FORWARD CALL] Generated TwiML: {twiml_str}")
+        print(f"[FORWARD TWIML] Generated TwiML: {twiml_str}")
         
         # Return TwiML with proper content type
         from starlette.responses import Response
         return Response(content=twiml_str, media_type="application/xml")
         
     except Exception as e:
-        print(f"[FORWARD CALL ERROR] {e}")
+        print(f"[FORWARD TWIML ERROR] Exception: {e}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/forward-call-status")
