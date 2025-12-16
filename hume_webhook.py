@@ -68,6 +68,9 @@ HUME_OUTBOUND_CONFIG_ID = os.getenv("HUME_OUTBOUND_CONFIG_ID", "58145c07-e3d6-43
 # Test mode - bypasses time checks for outbound calls (set to "true" to enable)
 OUTBOUND_TEST_MODE = os.getenv("OUTBOUND_TEST_MODE", "false").lower() == "true"
 
+# Vercel URL for callbacks (Vercel provides this automatically, or set manually)
+VERCEL_URL = os.getenv("VERCEL_URL", os.getenv("WEBHOOK_URL", "https://hume-tool-call.vercel.app"))
+
 # Twilio client for outbound calls
 twilio_client = None
 try:
@@ -770,19 +773,26 @@ def make_outbound_call(to_number: str, patient_id: str = None, appointment_id: s
             formatted_number = '+1' + ''.join(filter(str.isdigit, formatted_number))
         
         # Build webhook URL with OUTBOUND config (different system prompt for reminders)
-        # Include custom_session_id so the AI can look up appointment details
         webhook_url = f"https://api.hume.ai/v0/evi/twilio?config_id={HUME_OUTBOUND_CONFIG_ID}&api_key={HUME_API_KEY}"
+        
+        # Build statusCallback URL - Twilio will POST status updates here
+        # We pass appointment_id as a query parameter so we know which call it is
+        status_callback_url = f"{VERCEL_URL}/twilio-status"
         if appointment_id:
-            webhook_url += f"&custom_session_id={appointment_id}"
+            status_callback_url += f"?appointment_id={appointment_id}"
         
         print(f"[OUTBOUND CALL] Calling {formatted_number} from {TWILIO_PHONE_NUMBER}")
-        print(f"[OUTBOUND CALL] Custom session ID (appointment_id): {appointment_id}")
+        print(f"[OUTBOUND CALL] Appointment ID: {appointment_id}")
+        print(f"[OUTBOUND CALL] Status callback URL: {status_callback_url}")
         
-        # Make the call
+        # Make the call with statusCallback to track when call is answered/completed
         call = twilio_client.calls.create(
             to=formatted_number,
             from_=TWILIO_PHONE_NUMBER,
-            url=webhook_url
+            url=webhook_url,
+            status_callback=status_callback_url,
+            status_callback_event=['answered', 'completed'],
+            status_callback_method='POST'
         )
         
         print(f"[OUTBOUND CALL] Call initiated - SID: {call.sid}, Status: {call.status}")
@@ -862,14 +872,9 @@ async def process_pending_outbound_calls(hours_before: int = 24, calling_hours: 
                         print(f"[CRON] Skipping - outside calling hours ({current_hour} not in {calling_hours})")
                         continue  # Outside calling hours
                 
-                # Set status to in_progress BEFORE making the call
-                # This allows get_reminder_context to look up this call
-                supabase_client.table("outbound_calls").update({
-                    "status": "in_progress",
-                    "last_attempt_at": datetime.utcnow().isoformat(),
-                    "updated_at": datetime.utcnow().isoformat()
-                }).eq("appointment_id", call_record['appointment_id']).execute()
-                print(f"[CRON] Set status to in_progress for appointment {call_record['appointment_id']}")
+                # Status stays 'pending' until Twilio confirms call was answered
+                # Twilio's statusCallback will update to 'in_progress' when answered
+                # and 'completed' when the call ends
                 
                 # Make the call
                 call_result = make_outbound_call(
@@ -880,13 +885,16 @@ async def process_pending_outbound_calls(hours_before: int = 24, calling_hours: 
                 
                 # Update the record based on result
                 if call_result['success']:
+                    # Mark as 'calling' - Twilio's statusCallback will update to 'in_progress' when answered
                     supabase_client.table("outbound_calls").update({
-                        "status": "completed",
+                        "status": "calling",  # Intermediate status: call initiated but not answered yet
+                        "call_sid": call_result.get('call_sid'),  # Store Twilio's call SID
                         "call_attempts": call_record.get('call_attempts', 0) + 1,
                         "last_attempt_at": datetime.utcnow().isoformat(),
                         "updated_at": datetime.utcnow().isoformat()
                     }).eq("appointment_id", call_record['appointment_id']).execute()
                     processed += 1
+                    print(f"[CRON] Call initiated for {call_record['appointment_id']} - status: calling, SID: {call_result.get('call_sid')}")
                 else:
                     supabase_client.table("outbound_calls").update({
                         "status": "failed" if call_record.get('call_attempts', 0) >= 2 else "pending",
@@ -3499,11 +3507,14 @@ async def handle_get_reminder_context_tool(control_plane_client: AsyncControlPla
     try:
         appointment_id = custom_session_id
         
-        # If no custom_session_id, try to find the most recent in_progress outbound call
-        # This handles Twilio calls where custom_session_id isn't passed via URL
+        # If no custom_session_id, find the active outbound call
+        # Twilio's statusCallback updates the status when call is answered:
+        # - 'calling' = call initiated, ringing
+        # - 'in_progress' = call answered (set by Twilio statusCallback)
         if not appointment_id and supabase_client:
-            print("[REMINDER CONTEXT] No custom_session_id, looking up most recent in_progress call...")
+            print("[REMINDER CONTEXT] No custom_session_id, looking up active outbound call...")
             try:
+                # First try to find 'in_progress' (call answered)
                 result = supabase_client.table("outbound_calls") \
                     .select("appointment_id") \
                     .eq("status", "in_progress") \
@@ -3514,8 +3525,20 @@ async def handle_get_reminder_context_tool(control_plane_client: AsyncControlPla
                 if result.data and len(result.data) > 0:
                     appointment_id = result.data[0]['appointment_id']
                     print(f"[REMINDER CONTEXT] Found in_progress appointment: {appointment_id}")
+                else:
+                    # Fallback: check for 'calling' status (in case statusCallback is slightly delayed)
+                    result = supabase_client.table("outbound_calls") \
+                        .select("appointment_id") \
+                        .eq("status", "calling") \
+                        .order("last_attempt_at", desc=True) \
+                        .limit(1) \
+                        .execute()
+                    
+                    if result.data and len(result.data) > 0:
+                        appointment_id = result.data[0]['appointment_id']
+                        print(f"[REMINDER CONTEXT] Found calling appointment (statusCallback pending): {appointment_id}")
             except Exception as lookup_err:
-                print(f"[REMINDER CONTEXT] Error looking up in_progress call: {lookup_err}")
+                print(f"[REMINDER CONTEXT] Error looking up active call: {lookup_err}")
         
         print(f"[REMINDER CONTEXT] Looking up appointment: {appointment_id}")
         
@@ -3696,6 +3719,84 @@ async def test_outbound_call(request: Request):
     
     return JSONResponse(result)
 
+@app.post("/twilio-status")
+async def twilio_status_callback(request: Request):
+    """
+    Handle Twilio status callbacks for outbound calls.
+    
+    Twilio sends these events:
+    - 'answered': Call was answered by the patient
+    - 'completed': Call has ended
+    
+    We pass appointment_id as a query parameter when making the call,
+    so we can update the correct record in the outbound_calls table.
+    """
+    try:
+        # Get appointment_id from query params (we passed it in the statusCallback URL)
+        params = request.query_params
+        appointment_id = params.get("appointment_id")
+        
+        # Parse form data from Twilio (they send POST with form data)
+        form_data = await request.form()
+        call_status = form_data.get("CallStatus")
+        call_sid = form_data.get("CallSid")
+        
+        print(f"[TWILIO STATUS] Received callback - Status: {call_status}, SID: {call_sid}, Appointment: {appointment_id}")
+        
+        if not appointment_id:
+            print("[TWILIO STATUS] Warning: No appointment_id in callback")
+            return JSONResponse({"status": "ok", "warning": "no appointment_id"})
+        
+        if not supabase_client:
+            print("[TWILIO STATUS] Warning: Supabase client not available")
+            return JSONResponse({"status": "ok", "warning": "supabase unavailable"})
+        
+        # Update the outbound_calls record based on status
+        if call_status == "answered":
+            # Call was answered - set to in_progress so get_reminder_context can find it
+            print(f"[TWILIO STATUS] Call ANSWERED - Setting appointment {appointment_id} to in_progress")
+            supabase_client.table("outbound_calls").update({
+                "status": "in_progress",
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("appointment_id", appointment_id).execute()
+            
+        elif call_status == "completed":
+            # Call has ended - mark as completed
+            print(f"[TWILIO STATUS] Call COMPLETED - Setting appointment {appointment_id} to completed")
+            supabase_client.table("outbound_calls").update({
+                "status": "completed",
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("appointment_id", appointment_id).execute()
+            
+        elif call_status in ["busy", "no-answer", "failed", "canceled"]:
+            # Call failed - reset to pending for retry or mark as failed
+            print(f"[TWILIO STATUS] Call {call_status.upper()} - Handling appointment {appointment_id}")
+            
+            # Get current call attempts
+            result = supabase_client.table("outbound_calls").select("call_attempts").eq(
+                "appointment_id", appointment_id
+            ).execute()
+            
+            current_attempts = 0
+            if result.data:
+                current_attempts = result.data[0].get('call_attempts', 0)
+            
+            # If too many attempts, mark as failed; otherwise reset to pending for retry
+            new_status = "failed" if current_attempts >= 3 else "pending"
+            
+            supabase_client.table("outbound_calls").update({
+                "status": new_status,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("appointment_id", appointment_id).execute()
+            print(f"[TWILIO STATUS] Set appointment {appointment_id} to {new_status} (attempts: {current_attempts})")
+        
+        return JSONResponse({"status": "ok", "call_status": call_status, "appointment_id": appointment_id})
+        
+    except Exception as e:
+        print(f"[TWILIO STATUS ERROR] {e}")
+        # Always return 200 to Twilio to acknowledge receipt
+        return JSONResponse({"status": "error", "message": str(e)})
+
 @app.post("/hume-webhook")
 async def hume_webhook_handler(request: Request, event: WebhookEvent):
     """
@@ -3727,6 +3828,28 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             chat_id=event.chat_id,
             full_payload=event.dict()
         )
+        
+        # If this is an outbound call (from our outbound config), mark it as completed
+        config_id = getattr(event, 'config_id', None)
+        if config_id == HUME_OUTBOUND_CONFIG_ID and supabase_client:
+            try:
+                # Find the most recent in_progress call and mark it completed
+                result = supabase_client.table("outbound_calls") \
+                    .select("appointment_id") \
+                    .eq("status", "in_progress") \
+                    .order("last_attempt_at", desc=True) \
+                    .limit(1) \
+                    .execute()
+                
+                if result.data and len(result.data) > 0:
+                    appointment_id = result.data[0]['appointment_id']
+                    supabase_client.table("outbound_calls").update({
+                        "status": "completed",
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("appointment_id", appointment_id).execute()
+                    print(f"[CHAT ENDED] Marked outbound call {appointment_id} as completed")
+            except Exception as e:
+                print(f"[CHAT ENDED] Error updating outbound call status: {e}")
         
     elif isinstance(event, WebhookEventToolCall):
         print(f"[TOOL] Tool call received: {event.dict()}")
