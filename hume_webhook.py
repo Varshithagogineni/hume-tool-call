@@ -61,6 +61,9 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+16822773630")
 
+# Call forwarding configuration - number to transfer calls to
+CALL_FORWARD_NUMBER = os.getenv("CALL_FORWARD_NUMBER", "+15715442656")
+
 # Hume EVI Config IDs (set these in environment variables)
 HUME_CONFIG_ID = os.getenv("HUME_CONFIG_ID", "1c4db189-fe77-438c-bfc9-82155d7c4fd4")  # Inbound calls
 HUME_OUTBOUND_CONFIG_ID = os.getenv("HUME_OUTBOUND_CONFIG_ID", "58145c07-e3d6-435f-9963-cee34bbe598b")  # Outbound reminder calls
@@ -73,8 +76,10 @@ VERCEL_URL = os.getenv("VERCEL_URL", os.getenv("WEBHOOK_URL", "https://hume-tool
 
 # Twilio client for outbound calls
 twilio_client = None
+TwiML_VoiceResponse = None
 try:
     from twilio.rest import Client as TwilioClient
+    from twilio.twiml.voice_response import VoiceResponse as TwiML_VoiceResponse
     if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
         twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         print("[TWILIO] Client initialized successfully")
@@ -3494,6 +3499,168 @@ async def handle_reschedule_appointment_tool(control_plane_client: AsyncControlP
             )
         )
 
+async def handle_forward_call_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
+    """
+    Handle the forward_call tool - transfers the current call to a staff member (cold transfer).
+    
+    This uses Twilio's call update API to redirect the active call to our TwiML endpoint,
+    which then dials the forward number.
+    
+    Args:
+        control_plane_client: The control plane client instance
+        chat_id: The ID of the chat
+        tool_call_message: The tool call message
+    """
+    tool_call_id = tool_call_message.tool_call_id
+    tool_name = tool_call_message.name
+    
+    print(f"[TOOL] Processing tool: {tool_name}")
+    print(f"[TOOL] Tool call ID: {tool_call_id}")
+    
+    if tool_name != "forward_call":
+        print(f"[ERROR] Unknown tool: {tool_name}")
+        return
+    
+    try:
+        # Parse parameters from tool call
+        parameters = {}
+        if hasattr(tool_call_message, 'parameters') and tool_call_message.parameters:
+            if isinstance(tool_call_message.parameters, str):
+                try:
+                    parameters = json.loads(tool_call_message.parameters)
+                except:
+                    parameters = {}
+            else:
+                parameters = tool_call_message.parameters
+        
+        # Get optional reason for the transfer
+        reason = parameters.get("reason", "Patient requested to speak with staff")
+        forward_to = parameters.get("forward_to", CALL_FORWARD_NUMBER)
+        
+        print(f"[FORWARD CALL] Attempting to transfer call")
+        print(f"[FORWARD CALL] Reason: {reason}")
+        print(f"[FORWARD CALL] Forward to: {forward_to}")
+        
+        # Check if Twilio client is available
+        if not twilio_client:
+            response_content = "I apologize, but I'm unable to transfer the call right now. Our call transfer service is temporarily unavailable. Please call our office directly at the number provided, or I can help you with your request."
+            await safe_send_to_control_plane(
+                control_plane_client,
+                chat_id,
+                ToolResponseMessage(
+                    tool_call_id=tool_call_id,
+                    content=response_content
+                )
+            )
+            return
+        
+        # Get the active call SID from the chat
+        # We need to find the Twilio call associated with this Hume chat
+        # The call SID is typically passed as part of the session or we need to look it up
+        
+        # Try to get call SID from multiple sources
+        call_sid = None
+        
+        # Method 1: Try Supabase call_sessions table (for tracked inbound calls)
+        if supabase_client:
+            try:
+                result = supabase_client.table("call_sessions").select("twilio_call_sid, chat_started_payload").eq(
+                    "chat_id", chat_id
+                ).order("created_at", desc=True).limit(1).execute()
+                
+                if result.data:
+                    # Check direct twilio_call_sid field first
+                    if result.data[0].get("twilio_call_sid"):
+                        call_sid = result.data[0]["twilio_call_sid"]
+                        print(f"[FORWARD CALL] Found call SID from session: {call_sid}")
+                    else:
+                        # Try to extract from chat_started_payload (Hume may include Twilio metadata)
+                        payload = result.data[0].get("chat_started_payload", {})
+                        if isinstance(payload, str):
+                            try:
+                                payload = json.loads(payload)
+                            except:
+                                payload = {}
+                        
+                        # Check common locations for Twilio call SID in Hume payload
+                        call_sid = (
+                            payload.get("twilio_call_sid") or
+                            payload.get("call_sid") or
+                            payload.get("metadata", {}).get("twilio_call_sid") or
+                            payload.get("metadata", {}).get("CallSid")
+                        )
+                        if call_sid:
+                            print(f"[FORWARD CALL] Extracted call SID from payload: {call_sid}")
+                            
+            except Exception as lookup_err:
+                print(f"[FORWARD CALL] Error looking up call SID: {lookup_err}")
+        
+        # Method 2: Try to get the most recent active Twilio call to our number
+        if not call_sid and twilio_client:
+            try:
+                # List recent calls to our Twilio number that are in-progress
+                calls = twilio_client.calls.list(
+                    to=TWILIO_PHONE_NUMBER,
+                    status='in-progress',
+                    limit=5
+                )
+                if calls:
+                    call_sid = calls[0].sid
+                    print(f"[FORWARD CALL] Found active call via Twilio API: {call_sid}")
+            except Exception as twilio_lookup_err:
+                print(f"[FORWARD CALL] Error looking up active calls: {twilio_lookup_err}")
+        
+        # If we have a call SID, redirect the call to our forward TwiML
+        if call_sid:
+            try:
+                # Build the TwiML URL with the forward number
+                twiml_url = f"{VERCEL_URL}/forward-call-twiml?forward_to={forward_to}"
+                
+                print(f"[FORWARD CALL] Redirecting call {call_sid} to {twiml_url}")
+                
+                # Update the call to redirect to our TwiML
+                call = twilio_client.calls(call_sid).update(
+                    url=twiml_url,
+                    method="POST"
+                )
+                
+                print(f"[FORWARD CALL] Call redirect initiated - Status: {call.status}")
+                
+                response_content = f"I'm transferring you now. Please hold while I connect you with our team. Transfer reason: {reason}"
+                
+            except Exception as twilio_err:
+                print(f"[FORWARD CALL ERROR] Failed to redirect call: {twilio_err}")
+                response_content = f"I apologize, but I had trouble transferring your call. Please hold and I'll try again, or you can call our office directly. Error details have been logged."
+        else:
+            # No call SID found - provide the staff number directly
+            print(f"[FORWARD CALL] No call SID found for chat {chat_id} - providing direct number")
+            response_content = f"I'd be happy to connect you with our team! Please note down this number: {CALL_FORWARD_NUMBER}. You can call them directly and they'll be able to assist you right away. Is there anything else I can help you with in the meantime?"
+        
+        # Send the response back to Hume
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolResponseMessage(
+                tool_call_id=tool_call_id,
+                content=response_content
+            )
+        )
+        print(f"[SUCCESS] Forward call tool completed!")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle forward call tool: {e}")
+        
+        # Send error response
+        await safe_send_to_control_plane(
+            control_plane_client,
+            chat_id,
+            ToolErrorMessage(
+                tool_call_id=tool_call_id,
+                error="CallForwardError",
+                content=f"I'm having trouble transferring your call right now. Please try again or call our office directly at {CALL_FORWARD_NUMBER}. Our team will be happy to assist you."
+            )
+        )
+
 async def handle_get_reminder_context_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage, custom_session_id: str = None):
     """
     Handle the get_reminder_context tool call for outbound reminder calls.
@@ -3809,6 +3976,96 @@ async def twilio_status_callback(request: Request):
         # Always return 200 to Twilio to acknowledge receipt
         return JSONResponse({"status": "error", "message": str(e)})
 
+@app.post("/forward-call-twiml")
+@app.get("/forward-call-twiml")
+async def forward_call_twiml(request: Request):
+    """
+    Generate TwiML to forward/transfer a call to the configured number (cold transfer).
+    
+    This endpoint is called by Twilio when we redirect a call for forwarding.
+    The TwiML instructs Twilio to dial the forward number.
+    """
+    try:
+        # Get optional parameters from query string
+        params = request.query_params
+        forward_to = params.get("forward_to", CALL_FORWARD_NUMBER)
+        caller_id = params.get("caller_id", TWILIO_PHONE_NUMBER)
+        
+        print(f"[FORWARD CALL] Generating TwiML to forward call to {forward_to}")
+        
+        if not TwiML_VoiceResponse:
+            print("[FORWARD CALL ERROR] TwiML library not available")
+            return JSONResponse(
+                {"error": "TwiML library not available"}, 
+                status_code=500
+            )
+        
+        # Create TwiML response for cold transfer
+        response = TwiML_VoiceResponse()
+        
+        # Say a brief message before transfer
+        response.say(
+            "Please hold while I transfer your call.",
+            voice="Polly.Joanna"
+        )
+        
+        # Dial the forward number
+        # timeout: how long to wait for answer (30 seconds)
+        # callerId: shows the original Twilio number to the recipient
+        dial = response.dial(
+            timeout=30,
+            caller_id=caller_id,
+            action=f"{VERCEL_URL}/forward-call-status"  # Optional: track transfer result
+        )
+        dial.number(forward_to)
+        
+        # If no one answers, say goodbye
+        response.say(
+            "I'm sorry, but no one is available to take your call right now. Please try again later or leave a message.",
+            voice="Polly.Joanna"
+        )
+        response.hangup()
+        
+        twiml_str = str(response)
+        print(f"[FORWARD CALL] Generated TwiML: {twiml_str}")
+        
+        # Return TwiML with proper content type
+        from starlette.responses import Response
+        return Response(content=twiml_str, media_type="application/xml")
+        
+    except Exception as e:
+        print(f"[FORWARD CALL ERROR] {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/forward-call-status")
+async def forward_call_status(request: Request):
+    """
+    Handle the status callback after a call forward attempt.
+    This is optional but useful for logging/tracking transfer results.
+    """
+    try:
+        form_data = await request.form()
+        dial_call_status = form_data.get("DialCallStatus")
+        dial_call_sid = form_data.get("DialCallSid")
+        call_sid = form_data.get("CallSid")
+        
+        print(f"[FORWARD STATUS] Transfer result - Status: {dial_call_status}, DialSid: {dial_call_sid}, CallSid: {call_sid}")
+        
+        # You could log this to Supabase if needed
+        # For now, just acknowledge
+        
+        # Return empty TwiML (call has ended)
+        if TwiML_VoiceResponse:
+            response = TwiML_VoiceResponse()
+            from starlette.responses import Response
+            return Response(content=str(response), media_type="application/xml")
+        
+        return JSONResponse({"status": "ok"})
+        
+    except Exception as e:
+        print(f"[FORWARD STATUS ERROR] {e}")
+        return JSONResponse({"status": "error", "message": str(e)})
+
 @app.post("/hume-webhook")
 async def hume_webhook_handler(request: Request, event: WebhookEvent):
     """
@@ -3883,7 +4140,8 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
             "get_locations": handle_get_locations_tool,
             "book_appointment": handle_book_appointment_tool,
             "get_patient_appointments": handle_get_patient_appointments_tool,
-            "reschedule_appointment": handle_reschedule_appointment_tool
+            "reschedule_appointment": handle_reschedule_appointment_tool,
+            "forward_call": handle_forward_call_tool
         }
         
         # Special handling for get_reminder_context (needs custom_session_id)
