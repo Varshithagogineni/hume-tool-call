@@ -1175,7 +1175,7 @@ async def get_patient_appointments(patient_id, start_date=None, end_date=None, c
             "appointments": []
         }
 
-async def create_patient(first_name, last_name, date_of_birth, gender, email, phone_number, middle_name=None, address=None):
+async def create_patient(first_name, last_name, date_of_birth, email, phone_number, middle_name=None, address=None):
     """
     Create a new patient in the Syncronizer.io system.
     
@@ -1183,7 +1183,6 @@ async def create_patient(first_name, last_name, date_of_birth, gender, email, ph
         first_name: Patient's first name (required)
         last_name: Patient's last name (required)
         date_of_birth: Patient's DOB in YYYY-MM-DD format (required)
-        gender: Patient's gender - 'male', 'female', or 'other' (required)
         email: Patient's email address (required)
         phone_number: Patient's phone number (required)
         middle_name: Patient's middle name (optional)
@@ -1205,17 +1204,6 @@ async def create_patient(first_name, last_name, date_of_birth, gender, email, ph
         # Clean phone number (remove spaces, dashes, parentheses)
         clean_phone = ''.join(filter(str.isdigit, phone_number))
         
-        # Map gender to capitalized format (Male/Female/Other)
-        gender_map = {
-            "male": "Male",
-            "female": "Female",
-            "other": "Other",
-            "m": "Male",
-            "f": "Female",
-            "o": "Other"
-        }
-        gender_code = gender_map.get(gender.lower(), "Other")
-        
         # Get a default provider ID - we'll fetch the first available provider
         # This is required by the API for patient creation
         providers_result = await get_providers(location_id=SYNCRONIZER_LOCATION_ID)
@@ -1228,8 +1216,7 @@ async def create_patient(first_name, last_name, date_of_birth, gender, email, ph
         # The API expects proper JSON with nested objects
         bio_data = {
             "date_of_birth": date_of_birth,
-            "phone_number": clean_phone,
-            "gender": gender_code
+            "phone_number": clean_phone
         }
         
         # Add optional address fields to bio
@@ -1280,7 +1267,7 @@ async def create_patient(first_name, last_name, date_of_birth, gender, email, ph
             "Authorization": f"Bearer {bearer_token}"
         }
         
-        print(f"[CREATE PATIENT] Creating patient: {first_name} {last_name}, DOB: {date_of_birth}, Gender: {gender}")
+        print(f"[CREATE PATIENT] Creating patient: {first_name} {last_name}, DOB: {date_of_birth}")
         print(f"[CREATE PATIENT] Request body: {request_body}")
         
         # Make API request with JSON body
@@ -1310,7 +1297,6 @@ async def create_patient(first_name, last_name, date_of_birth, gender, email, ph
                     "first_name": patient.get("first_name"),
                     "last_name": patient.get("last_name"),
                     "date_of_birth": bio.get("date_of_birth"),
-                    "gender": bio.get("gender"),
                     "phone": bio.get("phone_number"),
                     "email": patient.get("email")
                 }
@@ -2587,7 +2573,6 @@ async def handle_create_patient_tool(control_plane_client: AsyncControlPlaneClie
         first_name = parameters.get("first_name")
         last_name = parameters.get("last_name")
         date_of_birth = parameters.get("date_of_birth")
-        gender = parameters.get("gender")
         email = parameters.get("email")
         phone_number = parameters.get("phone_number")
         
@@ -2604,10 +2589,10 @@ async def handle_create_patient_tool(control_plane_client: AsyncControlPlaneClie
                 # If parsing fails, create a simple dict with street_address
                 address = {"street_address": address}
         
-        print(f"[CREATE] Creating patient: {first_name} {last_name}, DOB: {date_of_birth}, Gender: {gender}")
+        print(f"[CREATE] Creating patient: {first_name} {last_name}, DOB: {date_of_birth}")
         
         # Validate required fields
-        if not all([first_name, last_name, date_of_birth, gender, email, phone_number]):
+        if not all([first_name, last_name, date_of_birth, email, phone_number]):
             missing_fields = []
             if not first_name:
                 missing_fields.append("first name")
@@ -2615,8 +2600,6 @@ async def handle_create_patient_tool(control_plane_client: AsyncControlPlaneClie
                 missing_fields.append("last name")
             if not date_of_birth:
                 missing_fields.append("date of birth")
-            if not gender:
-                missing_fields.append("gender")
             if not email:
                 missing_fields.append("email")
             if not phone_number:
@@ -2638,7 +2621,6 @@ async def handle_create_patient_tool(control_plane_client: AsyncControlPlaneClie
             first_name=first_name,
             last_name=last_name,
             date_of_birth=date_of_birth,
-            gender=gender,
             email=email,
             phone_number=phone_number,
             middle_name=middle_name,
