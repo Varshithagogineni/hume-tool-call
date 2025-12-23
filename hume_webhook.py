@@ -373,23 +373,6 @@ async def logged_httpx_request(method: str, url: str, **kwargs):
 # END SUPABASE LOGGING FUNCTIONS
 # =====================================================
 
-# Dad joke generator
-def get_dad_joke():
-    """Generate a random dad joke."""
-    jokes = [
-        "Why don't scientists trust atoms? Because they make up everything.",
-        "I only know 25 letters of the alphabet. I don't know y.",
-        "Why did the scarecrow win an award? Because he was outstanding in his field.",
-        "Why don't eggs tell jokes? They'd crack each other up.",
-        "What do you call fake spaghetti? An impasta.",
-        "I used to hate facial hair, but then it grew on me.",
-        "What do you call a bear with no teeth? A gummy bear!",
-        "Why don't scientists trust atoms? Because they make up everything!",
-        "What's the best thing about Switzerland? I don't know, but the flag is a big plus.",
-        "Why did the math book look so sad? Because it was full of problems."
-    ]
-    return random.choice(jokes)
-
 # Syncronizer.io API functions for tool calls
 async def authenticate_syncronizer():
     """
@@ -3606,55 +3589,6 @@ Now greet the patient warmly using their first name and remind them about their 
             )
         )
 
-async def handle_dad_joke_tool(control_plane_client: AsyncControlPlaneClient, chat_id: str, tool_call_message: ToolCallMessage):
-    """
-    Handle the tell_dad_joke tool call and send the response back to the chat.
-    
-    Args:
-        control_plane_client: The control plane client instance
-        chat_id: The ID of the chat
-        tool_call_message: The tool call message
-    """
-    tool_call_id = tool_call_message.tool_call_id
-    tool_name = tool_call_message.name
-    
-    print(f"[TOOL] Processing tool: {tool_name}")
-    print(f"[TOOL] Tool call ID: {tool_call_id}")
-    
-    if tool_name != "tell_dad_joke":
-        print(f"[ERROR] Unknown tool: {tool_name}")
-        return
-    
-    try:
-        # Generate a dad joke
-        joke = get_dad_joke()
-        print(f"[JOKE] Generated joke: {joke}")
-        
-        # Send the joke as a tool response
-        await safe_send_to_control_plane(
-            control_plane_client,
-            chat_id,
-            ToolResponseMessage(
-                tool_call_id=tool_call_id,
-                content=joke
-            )
-        )
-        print(f"[SUCCESS] Dad joke sent successfully!")
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to handle dad joke tool: {e}")
-        
-        # Send error response
-        await safe_send_to_control_plane(
-            control_plane_client,
-            chat_id,
-            ToolErrorMessage(
-                tool_call_id=tool_call_id,
-                error="DadJokeError",
-                content=f"Sorry, I couldn't generate a dad joke right now: {str(e)}"
-            )
-        )
-
 @app.get("/")
 async def root():
     """Root endpoint - confirms webhook is running."""
@@ -3972,7 +3906,6 @@ async def hume_webhook_handler(request: Request, event: WebhookEvent):
         
         # Map tool names to handler functions
         tool_handlers = {
-            "tell_dad_joke": handle_dad_joke_tool,
             "search_patients": handle_search_patients_tool,
             "create_patient": handle_create_patient_tool,
             "get_providers": handle_get_providers_tool,
