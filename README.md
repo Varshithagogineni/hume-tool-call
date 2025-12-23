@@ -80,7 +80,7 @@ Dental practices handle high volumes of routine phone calls for scheduling, resc
 | Telephony | Twilio | Inbound/outbound call handling |
 | Practice Management | NexHealth (Syncronizer.io) | Patient and appointment data |
 | Database | Supabase | Event logging and call tracking |
-| Deployment | Vercel / Docker | Serverless or container hosting |
+| Deployment | Vercel | Serverless or container hosting |
 
 ---
 
