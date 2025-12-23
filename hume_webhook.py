@@ -23,14 +23,14 @@ from supabase import create_client, Client
 # FastAPI app instance
 app = FastAPI()
 
-# API Key - get from environment or use fallback
-HUME_API_KEY = os.getenv("HUME_API_KEY", "ZvEVO2dQuKoVcshTyW6zVs48aVir5FJgpMnTyKGvZkt7FzYg")
+# API Key - get from environment
+HUME_API_KEY = os.getenv("HUME_API_KEY")
 
 # Syncronizer.io credentials
-SYNCRONIZER_API_KEY = "dXNlci0xMTc3LXNhbmRib3g.rHgHePj9Lfz7DhEGKL7CMuvA2HRRx7Wo"
-SYNCRONIZER_SUBDOMAIN = "sabastian-demo-practice"
-SYNCRONIZER_LOCATION_ID = 334724
-SYNCRONIZER_BASE_URL = "https://nexhealth.info"
+SYNCRONIZER_API_KEY = os.getenv("SYNCRONIZER_API_KEY")
+SYNCRONIZER_SUBDOMAIN = os.getenv("SYNCRONIZER_SUBDOMAIN")
+SYNCRONIZER_LOCATION_ID = int(os.getenv("SYNCRONIZER_LOCATION_ID", "0"))
+SYNCRONIZER_BASE_URL = os.getenv("SYNCRONIZER_BASE_URL")
 
 # Bearer token cache (will be fetched from authentication)
 _bearer_token = None
@@ -41,8 +41,8 @@ client = AsyncHumeClient(api_key=HUME_API_KEY)
 control_plane_client = AsyncControlPlaneClient(client_wrapper=client._client_wrapper)
 
 # Supabase client for event logging
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://bxwtazqgyhcurgeornox.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_FqOfee969k0OUF_OTTA3wg_taFkQ4oZ")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase_client: Client = None
 
 # Initialize Supabase client if credentials are provided
@@ -59,14 +59,14 @@ else:
 # Twilio configuration for outbound calls (set these in environment variables)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+16822773630")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
 # Call forwarding configuration - number to transfer calls to
-CALL_FORWARD_NUMBER = os.getenv("CALL_FORWARD_NUMBER", "+15715442656")
+CALL_FORWARD_NUMBER = os.getenv("CALL_FORWARD_NUMBER")
 
 # Hume EVI Config IDs (set these in environment variables)
-HUME_CONFIG_ID = os.getenv("HUME_CONFIG_ID", "1c4db189-fe77-438c-bfc9-82155d7c4fd4")  # Inbound calls
-HUME_OUTBOUND_CONFIG_ID = os.getenv("HUME_OUTBOUND_CONFIG_ID", "58145c07-e3d6-435f-9963-cee34bbe598b")  # Outbound reminder calls
+HUME_CONFIG_ID = os.getenv("HUME_CONFIG_ID")  # Inbound calls
+HUME_OUTBOUND_CONFIG_ID = os.getenv("HUME_OUTBOUND_CONFIG_ID")  # Outbound reminder calls
 
 # Test mode - bypasses time checks for outbound calls (set to "true" to enable)
 OUTBOUND_TEST_MODE = os.getenv("OUTBOUND_TEST_MODE", "false").lower() == "true"
@@ -75,10 +75,10 @@ OUTBOUND_TEST_MODE = os.getenv("OUTBOUND_TEST_MODE", "false").lower() == "true"
 # IMPORTANT: Use a stable production URL for Twilio callbacks, NOT the preview deployment URL
 # The VERCEL_URL env var gives preview URLs like "hume-tool-call-abc123-account.vercel.app" which are temporary
 # For Twilio callbacks, we need the stable production URL
-TWILIO_CALLBACK_URL = os.getenv("TWILIO_CALLBACK_URL", "https://hume-tool-call.vercel.app")
+TWILIO_CALLBACK_URL = os.getenv("TWILIO_CALLBACK_URL")
 
 # General Vercel URL (may be preview URL during deployments)
-_raw_vercel_url = os.getenv("VERCEL_URL", os.getenv("WEBHOOK_URL", "https://hume-tool-call.vercel.app"))
+_raw_vercel_url = os.getenv("VERCEL_URL", os.getenv("WEBHOOK_URL", ""))
 # Ensure URL has https:// prefix (Vercel sometimes provides URL without protocol)
 VERCEL_URL = _raw_vercel_url if _raw_vercel_url.startswith('http') else f"https://{_raw_vercel_url}"
 
@@ -153,12 +153,6 @@ WHAT GETS LOGGED:
    - Response content sent back to Hume
    - Linked to call_sessions via chat_id
    
-3. NexHealth API Calls (nexhealth_api_logs table):
-   - Every HTTP request to NexHealth Synchronizer API
-   - Request/response details, timing, status codes
-   - Linked to tool_call_events via tool_call_id
-   - Sensitive headers (Authorization) are redacted
-
 HOW IT WORKS:
 - log_and_execute_tool() wraps all tool handlers
 - Context variables (_current_chat_id, _current_tool_call_id) track the current execution context
@@ -167,8 +161,7 @@ HOW IT WORKS:
 
 USAGE:
 1. Wrap tool handlers with log_and_execute_tool() (already done in webhook router)
-2. Use logged_httpx_request() instead of httpx.AsyncClient() for automatic API logging
-3. Or manually call log_nexhealth_api_call() for specific API calls
+2. Use logged_httpx_request() instead of httpx.AsyncClient() for HTTP requests
 
 PRIVACY & SECURITY:
 - Authorization headers are redacted in logs
@@ -348,87 +341,9 @@ async def log_tool_call_result(
         print(f"[SUPABASE ERROR] Failed to log tool call result: {e}")
         return None
 
-async def log_nexhealth_api_call(
-    chat_id: str,
-    tool_call_id: str,
-    endpoint: str,
-    http_method: str,
-    request_url: str = None,
-    request_headers: dict = None,
-    request_params: dict = None,
-    request_body: dict = None,
-    response_status: int = None,
-    response_headers: dict = None,
-    response_body: dict = None,
-    response_time_ms: int = None,
-    success: bool = None,
-    error_message: str = None,
-    error_type: str = None
-):
-    """
-    Log a NexHealth API call to Supabase.
-    
-    Args:
-        chat_id: Chat ID
-        tool_call_id: Associated tool call ID
-        endpoint: API endpoint path
-        http_method: HTTP method (GET, POST, etc.)
-        request_url: Full request URL
-        request_headers: Request headers (sensitive data removed)
-        request_params: Query parameters
-        request_body: Request body
-        response_status: HTTP response status code
-        response_headers: Response headers
-        response_body: Response body
-        response_time_ms: Response time in milliseconds
-        success: Whether the call succeeded
-        error_message: Error message if failed
-        error_type: Type of error
-    """
-    if not supabase_client:
-        return
-    
-    try:
-        # Remove sensitive data from headers
-        safe_request_headers = {}
-        if request_headers:
-            safe_request_headers = {k: v for k, v in request_headers.items() if k.lower() not in ['authorization', 'api-key']}
-            if 'Authorization' in request_headers or 'authorization' in request_headers:
-                safe_request_headers['Authorization'] = 'Bearer ***'
-        
-        safe_response_headers = {}
-        if response_headers:
-            safe_response_headers = {k: v for k, v in response_headers.items() if k.lower() not in ['authorization', 'api-key']}
-        
-        data = {
-            "chat_id": chat_id,
-            "tool_call_id": tool_call_id,
-            "endpoint": endpoint,
-            "http_method": http_method,
-            "request_url": request_url,
-            "request_headers": safe_request_headers,
-            "request_params": request_params,
-            "request_body": request_body,
-            "response_status": response_status,
-            "response_headers": safe_response_headers,
-            "response_body": response_body,
-            "response_time_ms": response_time_ms,
-            "called_at": datetime.utcnow().isoformat(),
-            "success": success,
-            "error_message": error_message,
-            "error_type": error_type
-        }
-        
-        result = supabase_client.table("nexhealth_api_logs").insert(data).execute()
-        print(f"[SUPABASE] Logged NexHealth API call: {http_method} {endpoint} (status={response_status})")
-        return result
-    except Exception as e:
-        print(f"[SUPABASE ERROR] Failed to log NexHealth API call: {e}")
-        return None
-
 async def logged_httpx_request(method: str, url: str, **kwargs):
     """
-    Wrapper for httpx requests that automatically logs to Supabase.
+    Wrapper for httpx requests.
     
     Args:
         method: HTTP method (GET, POST, PATCH, etc.)
@@ -438,95 +353,21 @@ async def logged_httpx_request(method: str, url: str, **kwargs):
     Returns:
         httpx.Response object
     """
-    start_time = time.time()
-    chat_id = _current_chat_id.get()
-    tool_call_id = _current_tool_call_id.get()
+    async with httpx.AsyncClient() as client:
+        if method.upper() == 'GET':
+            response = await client.get(url, **kwargs)
+        elif method.upper() == 'POST':
+            response = await client.post(url, **kwargs)
+        elif method.upper() == 'PATCH':
+            response = await client.patch(url, **kwargs)
+        elif method.upper() == 'PUT':
+            response = await client.put(url, **kwargs)
+        elif method.upper() == 'DELETE':
+            response = await client.delete(url, **kwargs)
+        else:
+            response = await client.request(method, url, **kwargs)
     
-    # Extract endpoint from URL
-    endpoint = url.replace(SYNCRONIZER_BASE_URL, '') if SYNCRONIZER_BASE_URL in url else url
-    
-    # Extract request details
-    request_params = kwargs.get('params', {})
-    request_body = kwargs.get('json', kwargs.get('data'))
-    request_headers = kwargs.get('headers', {})
-    
-    response = None
-    error_msg = None
-    error_type_val = None
-    
-    try:
-        # Make the actual HTTP request
-        async with httpx.AsyncClient() as client:
-            if method.upper() == 'GET':
-                response = await client.get(url, **kwargs)
-            elif method.upper() == 'POST':
-                response = await client.post(url, **kwargs)
-            elif method.upper() == 'PATCH':
-                response = await client.patch(url, **kwargs)
-            elif method.upper() == 'PUT':
-                response = await client.put(url, **kwargs)
-            elif method.upper() == 'DELETE':
-                response = await client.delete(url, **kwargs)
-            else:
-                response = await client.request(method, url, **kwargs)
-        
-        response_time_ms = int((time.time() - start_time) * 1000)
-        
-        # Parse response body
-        try:
-            response_body = response.json()
-        except:
-            response_body = {"raw": response.text}
-        
-        # Log to Supabase
-        if chat_id and tool_call_id:
-            await log_nexhealth_api_call(
-                chat_id=chat_id,
-                tool_call_id=tool_call_id,
-                endpoint=endpoint,
-                http_method=method.upper(),
-                request_url=url,
-                request_headers=request_headers,
-                request_params=request_params,
-                request_body=request_body if isinstance(request_body, dict) else None,
-                response_status=response.status_code,
-                response_headers=dict(response.headers),
-                response_body=response_body,
-                response_time_ms=response_time_ms,
-                success=200 <= response.status_code < 300,
-                error_message=None,
-                error_type=None
-            )
-        
-        return response
-        
-    except Exception as e:
-        response_time_ms = int((time.time() - start_time) * 1000)
-        error_msg = str(e)
-        error_type_val = type(e).__name__
-        
-        # Log error to Supabase
-        if chat_id and tool_call_id:
-            await log_nexhealth_api_call(
-                chat_id=chat_id,
-                tool_call_id=tool_call_id,
-                endpoint=endpoint,
-                http_method=method.upper(),
-                request_url=url,
-                request_headers=request_headers,
-                request_params=request_params,
-                request_body=request_body if isinstance(request_body, dict) else None,
-                response_status=response.status_code if response else None,
-                response_headers=dict(response.headers) if response else None,
-                response_body=None,
-                response_time_ms=response_time_ms,
-                success=False,
-                error_message=error_msg,
-                error_type=error_type_val
-            )
-        
-        # Re-raise the exception
-        raise
+    return response
 
 # =====================================================
 # END SUPABASE LOGGING FUNCTIONS
